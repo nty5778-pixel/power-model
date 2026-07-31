@@ -24,6 +24,7 @@ CFG = json.load(open(os.path.join(HERE, "config.json")))
 M3 = [lgb.Booster(model_file=os.path.join(HERE, "models", f"m3_{s}.txt")) for s in CFG["seeds"]]
 MS = [lgb.Booster(model_file=os.path.join(HERE, "models", f"ms_{s}.txt")) for s in CFG["seeds"]]
 
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 MIS_LIST = "https://www.ercot.com/misapp/servlets/IceDocListJsonWS?reportTypeId={rid}"
 MIS_DL = "https://www.ercot.com/misdownload/servlets/mirDownload?doclookupId={docid}"
 RID = {"load_fcst": 12312, "wind": 13028, "solar": 13483, "outage": 13103,
@@ -35,14 +36,14 @@ class ScoreReq(BaseModel):
     state: list
 
 def mis_latest_doc(rid, before=None):
-    j = requests.get(MIS_LIST.format(rid=rid), timeout=60).json()
+    j = requests.get(MIS_LIST.format(rid=rid), headers=UA, timeout=60).json()
     docs = [d["Document"] for d in j["ListDocsByRptTypeRes"]["DocumentList"]]
     if before:
         docs = [d for d in docs if d["PublishDate"] <= before]
     return docs[0]
 
 def mis_read_csv(docid):
-    r = requests.get(MIS_DL.format(docid=docid), timeout=120)
+    r = requests.get(MIS_DL.format(docid=docid), headers=UA, timeout=120)
     z = zipfile.ZipFile(io.BytesIO(r.content))
     return pd.read_csv(io.BytesIO(z.read(z.namelist()[0])))
 
@@ -150,6 +151,15 @@ def health():
 
 @app.post("/score")
 def score(req: ScoreReq):
+    import traceback
+    try:
+        return _score(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e} | {traceback.format_exc().splitlines()[-3:]}")
+
+def _score(req: ScoreReq):
     st = pd.DataFrame(req.state)
     if len(st) < 24 * 10:
         raise HTTPException(400, f"state too short: {len(st)} rows (need >= 240)")
