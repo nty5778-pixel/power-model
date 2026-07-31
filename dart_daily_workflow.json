@@ -1,0 +1,157 @@
+{
+  "name": "ERCOT DART Daily Scorer",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "30 8 * * *" }
+          ]
+        }
+      },
+      "id": "schedule",
+      "name": "Schedule 08:30 CT",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "notes": "n8n 인스턴스 타임존을 America/Chicago로 설정하거나 cron을 UTC로 환산"
+    },
+    {
+      "parameters": {
+        "url": "https://YOUR-RENDER-APP.onrender.com/health",
+        "options": { "timeout": 120000 }
+      },
+      "id": "warmup",
+      "name": "Warmup Render",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [200, 0],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "state", "mode": "name" },
+        "options": {}
+      },
+      "id": "read_state",
+      "name": "Read state tab",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [400, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst recent = rows.slice(-480); // 최근 20일\nreturn [{ json: { state: recent } }];"
+      },
+      "id": "pack_state",
+      "name": "Pack state (last 480 rows)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-RENDER-APP.onrender.com/score",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: $json.state }) }}",
+        "options": { "timeout": 300000 }
+      },
+      "id": "score",
+      "name": "POST /score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst gen = r.meta.generated_at;\nreturn r.predictions.map(p => ({ json: { ...p, generated_at: gen } }));"
+      },
+      "id": "split_preds",
+      "name": "Split predictions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, -150]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "predictions", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData" },
+        "options": {}
+      },
+      "id": "append_preds",
+      "name": "Append predictions",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1200, -150]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $('POST /score').first().json.new_state.map(s => ({ json: s }));"
+      },
+      "id": "split_state",
+      "name": "Split new_state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 0]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "state", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData" },
+        "options": {}
+      },
+      "id": "append_state",
+      "name": "Append state",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1200, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $('POST /score').first().json.settlements.map(s => ({ json: s }));"
+      },
+      "id": "split_settle",
+      "name": "Split settlements",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 150]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "actuals", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData" },
+        "options": {}
+      },
+      "id": "append_actuals",
+      "name": "Append actuals",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1200, 150]
+    }
+  ],
+  "connections": {
+    "Schedule 08:30 CT": { "main": [[{ "node": "Warmup Render", "type": "main", "index": 0 }]] },
+    "Warmup Render": { "main": [[{ "node": "Read state tab", "type": "main", "index": 0 }]] },
+    "Read state tab": { "main": [[{ "node": "Pack state (last 480 rows)", "type": "main", "index": 0 }]] },
+    "Pack state (last 480 rows)": { "main": [[{ "node": "POST /score", "type": "main", "index": 0 }]] },
+    "POST /score": { "main": [[
+      { "node": "Split predictions", "type": "main", "index": 0 },
+      { "node": "Split new_state", "type": "main", "index": 0 },
+      { "node": "Split settlements", "type": "main", "index": 0 }
+    ]] },
+    "Split predictions": { "main": [[{ "node": "Append predictions", "type": "main", "index": 0 }]] },
+    "Split new_state": { "main": [[{ "node": "Append state", "type": "main", "index": 0 }]] },
+    "Split settlements": { "main": [[{ "node": "Append actuals", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "timezone": "America/Chicago" }
+}
