@@ -34,6 +34,7 @@ app = FastAPI()
 
 class ScoreReq(BaseModel):
     state: list
+    weather: dict | None = None   # {"time": [...], "temperature_2m": [...]} — n8n이 Open-Meteo에서 받아 전달
 
 def mis_latest_doc(rid, before=None):
     j = requests.get(MIS_LIST.format(rid=rid), headers=UA, timeout=60).json()
@@ -50,7 +51,7 @@ def mis_read_csv(docid):
 def hours_of(day):
     return pd.date_range(pd.Timestamp(day), periods=24, freq="h")
 
-def fetch_target_day_inputs(target):
+def fetch_target_day_inputs(target, weather=None):
     """MIS 최신 발행분에서 딜리버리일=target 행 추출."""
     out = {}
     # load forecast (weather zones)
@@ -86,11 +87,23 @@ def fetch_target_day_inputs(target):
     out["outage_houston"] = pd.Series(sel["TotalResourceMWZoneHouston"].values, index=i4)
     out["outage_irr"] = pd.Series(irr.values, index=i4)
     # weather: 내일 예보 + 최근 실적(analysis)
-    wm = requests.get("https://api.open-meteo.com/v1/forecast", params=dict(
-        latitude=29.76, longitude=-95.36, hourly="temperature_2m",
-        past_days=10, forecast_days=3, timezone="America/Chicago"), timeout=60).json()
-    tt = pd.to_datetime(wm["hourly"]["time"])
-    temps = pd.Series(wm["hourly"]["temperature_2m"], index=tt)
+    if weather and weather.get("time"):
+        tt = pd.to_datetime(weather["time"])
+        temps = pd.Series(weather["temperature_2m"], index=tt)
+    else:
+        import time as _time
+        wm = None
+        for attempt in range(3):
+            wm = requests.get("https://api.open-meteo.com/v1/forecast", params=dict(
+                latitude=29.76, longitude=-95.36, hourly="temperature_2m",
+                past_days=10, forecast_days=3, timezone="America/Chicago"), timeout=60).json()
+            if "hourly" in wm:
+                break
+            _time.sleep(3)
+        if "hourly" not in wm:
+            raise HTTPException(502, f"Open-Meteo unavailable from server: {str(wm)[:200]} — n8n에서 weather를 body로 전달하세요")
+        tt = pd.to_datetime(wm["hourly"]["time"])
+        temps = pd.Series(wm["hourly"]["temperature_2m"], index=tt)
     out["temp_fcst"] = temps.reindex(hours_of(target))
     out["temp_recent"] = temps  # past analysis + forecast mix; 과거 구간은 실적 근사
     return out
@@ -173,7 +186,7 @@ def _score(req: ScoreReq):
     target = (now + dt.timedelta(days=1)).date()
     hrs = hours_of(target)
 
-    inp = fetch_target_day_inputs(target)
+    inp = fetch_target_day_inputs(target, req.weather)
     eia = fetch_eia_actuals()
 
     # ---- 상태 결합 (과거 = state, 오늘 타깃 = 신규 fetch) ----
