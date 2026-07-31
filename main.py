@@ -122,6 +122,7 @@ def fetch_eia_actuals(days_back=6):
     df = pd.DataFrame(rows)
     if len(df) == 0:
         return None
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["dt"] = pd.to_datetime(df["period"], utc=True).dt.tz_convert(CT).dt.tz_localize(None) - pd.Timedelta(hours=1)  # hour-ending 보정
     piv = df.pivot_table(index="dt", columns="fueltype", values="value", aggfunc="first")
     return piv.rename(columns={"WND": "wind", "SUN": "solar"})
