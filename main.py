@@ -398,6 +398,47 @@ def health():
     return {"ok": True, "trained_through": CFG["trained_through"]}
 
 
+@app.get("/probe")
+def probe(day: str = ""):
+    """브라우저에서 바로 열어보는 진단용. state 없이 MIS만 확인한다.
+    예) https://<app>.onrender.com/probe            → 내일치
+        https://<app>.onrender.com/probe?day=2026-08-02
+    """
+    now = dt.datetime.now(CT)
+    target = (dt.date.fromisoformat(day) if day
+              else (now + dt.timedelta(days=1)).date())
+    cache = {}
+    out = {"now_ct": str(now), "target_day": str(target), "products": {}}
+    pubs = [target - dt.timedelta(days=1), target,
+            target - dt.timedelta(days=2), target + dt.timedelta(days=1)]
+    spec = {
+        "load_fcst": (RID["load_fcst"], "DeliveryDate", "DSTFlag"),
+        "wind":      (RID["wind"], "DELIVERY_DATE", "DSTFlag"),
+        "solar":     (RID["solar"], "DELIVERY_DATE", "DSTFlag"),
+        "outage":    (RID["outage"], "Date", None),
+    }
+    for name, (rid, datecol, dstcol) in spec.items():
+        try:
+            docs = mis_doc_list(rid, cache)
+            avail = sorted({str(d.get("PublishDate", ""))[:10] for d in docs} - {""})
+        except Exception as e:
+            out["products"][name] = {"error": f"{type(e).__name__}: {e}"}
+            continue
+        sel, info = _load_product(rid, target, cache, datecol, None, dstcol, pubs, name)
+        out["products"][name] = {
+            "ok": sel is not None,
+            "rows": (0 if sel is None else int(len(sel))),
+            "pub_used": (info if sel is not None else None),
+            "reason": (None if sel is not None else info),
+            "mis_publish_dates_available": avail[-10:],
+        }
+    out["all_ok"] = all(v.get("ok") for v in out["products"].values())
+    out["hint"] = ("정상 — /score 실패 원인은 MIS가 아님(state 부족·날씨·시트 쪽 확인)"
+                   if out["all_ok"] else
+                   "위 reason이 그날 예측이 비는 직접 원인. MIS 미발행이면 시간을 늦춰 재실행")
+    return out
+
+
 @app.post("/score")
 def score(req: ScoreReq):
     import traceback

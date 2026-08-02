@@ -78,3 +78,62 @@ dt_local	ens_e_dart	ens_decision	ens_p_spike	m3_7_p_da	m3_7_p_rt	m3_7_e_dart	m3_
   → 특정 시드가 지속 열위면 다음 재학습에서 교체 후보
 
 일일 요약(Claude)에도 `lowAgree`(agree_n≤3 시간 수), `avgStd`, `maxStd` 가 자동으로 전달됩니다.
+
+## 9. Sheets 쿼터 초과 대응 — 워크플로 v9 (배치 Append)
+
+**증상**: `Quota exceeded for quota metric 'Read requests' ... sheets.googleapis.com`
+**원인**: n8n Google Sheets Append 노드는 **입력 아이템(=행)마다** 헤더를 읽는다.
+백필로 predictions 168행 + model_detail 168행 + state 168행이 나가면 읽기 요청이 수백 회 →
+분당 60회(사용자당) 한도 초과. 행이 많을수록 반드시 재발한다.
+
+**해결**: Append를 Sheets REST API 배치 호출로 교체. 노드 6쌍(Split×6 + Append×6)을 3개로 통합.
+
+| | 기존 v8 | v9 |
+|---|---|---|
+| 쓰기 관련 API 호출 | 행 수만큼 (수백) | **헤더읽기 1 + 탭당 1 = 최대 7** |
+| 노드 수 | 24 | 15 |
+
+새 노드 3개
+- `Read headers (1 call)` — `values:batchGet` 로 6개 탭 헤더를 **한 번에** 읽음
+- `Build appends` — /score 결과와 Claude 요약을 **시트에 실제로 있는 헤더 순서대로** 2차원 배열로 패킹.
+  시트에 없는 컬럼은 무시되고, 값이 없는 컬럼은 빈칸이 된다 (헤더 순서를 바꿔도 안전)
+- `Append rows (batch)` — `values:append` 를 탭당 1회 POST. 재시도 3회, 호출 간 1.5초 간격
+
+### 설정 시 주의
+1. 두 HTTP 노드의 인증은 **Predefined Credential Type → Google Sheets OAuth2 API**로 잡고
+   기존 Google Sheets 자격증명을 그대로 선택하면 된다 (새 크리덴셜 불필요).
+2. **6개 탭이 모두 존재해야 한다** — `predictions, model_detail, state, actuals, daily_summary, runlog`.
+   `batchGet`은 탭 하나라도 없으면 요청 전체가 400으로 실패한다. 없는 탭은 헤더만이라도 만들어 둘 것.
+3. `daily_summary` 권장 헤더:
+   `run_at, target_day, n_da, n_neutral, n_rt, max_p_spike, low_agree_hours, avg_e_dart_std, backfilled, claude_summary`
+4. Claude 요약 노드는 실패해도 계속 진행하도록(`continueRegularOutput`) 바뀌었다 —
+   Anthropic API가 죽어도 predictions/state/actuals 적재는 정상 수행된다.
+
+### 그래도 쿼터가 나면
+상단 읽기 노드 3개(`Read state tab`, `Read predictions (days)`, `Read actuals (days)`)가 남아 있다.
+`Read state tab`은 append-only라 계속 커지므로, 6개월쯤 뒤 state 탭이 수천 행이 되면
+탭을 최근 30일만 남기고 잘라내면 된다 (모델은 최근 16일만 사용).
+
+## 10. /probe — 예측이 비었을 때 첫 번째로 볼 것 (v10)
+
+`predictions[]`가 비면 원인은 **항상** `/score` 응답의 `meta.skipped_days` 에 문자열로 들어 있다.
+내일치는 코드상 무조건 처리 대상이므로, 비었다는 건 그날이 skip 됐다는 뜻뿐이다.
+
+n8n을 열 필요 없이 브라우저에서 바로 확인:
+```
+https://power-model.onrender.com/probe
+https://power-model.onrender.com/probe?day=2026-08-02
+```
+state·날씨 없이 ERCOT MIS만 조회해서 상품 4종(load_fcst, wind, solar, outage)이
+그 딜리버리일에 대해 잡히는지, 어느 발행일에서 잡혔는지, 안 잡혔으면 왜인지 보여준다.
+
+읽는 법
+- `all_ok: true` → MIS는 정상. 원인은 state 부족 / 날씨 / 시트 쪽
+- `all_ok: false` → `reason`이 직접 원인. 예 `wind[2026-08-01:없음,2026-08-02:없음,...]`
+  = 08:30 실행 시점에 그 상품이 아직 미발행. 스케줄을 09:30으로 늦추면 해결되는 경우가 많다
+- `mis_publish_dates_available` = MIS가 현재 보관 중인 발행일(7일). 여기 없는 날짜는 복원 불가(정상)
+
+### n8n 쪽 점검 순서
+1. `POST /score` 노드 출력에서 `meta.skipped_days` / `meta.todo_days` 확인 — Split이 비는 건 결과이지 원인이 아님
+2. 워크플로 v9를 임포트했다면 Split 노드는 존재하지 않는다. 화면에 Split이 보이면 아직 v8이므로 v9로 교체
+3. 그래도 비면 `/probe` 결과를 그대로 공유
