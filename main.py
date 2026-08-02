@@ -1,5 +1,6 @@
 """
-ERCOT DART 3-class procurement scorer — Render web service. (v6: 백필 지원)
+ERCOT DART 3-class procurement scorer — Render web service.
+(v9: 개별 모델(시드별) 출력 model_detail 추가)
 
 POST /score
   body: {
@@ -11,7 +12,7 @@ POST /score
     "have_actual_days": ["2026-07-29", ...],   # 선택: actuals 탭에 이미 있는 날짜
     "max_backfill_days": 7                     # 선택 (기본 7, MIS 보관한도)
   }
-returns: {predictions:[...], new_state:[...], settlements:[...], meta:{...}}
+returns: {predictions:[...], model_detail:[...], new_state:[...], settlements:[...], meta:{...}}
 
 동작:
   - 내일치를 항상 처리하고, 최근 max_backfill_days 이내에서
@@ -101,61 +102,77 @@ def dedup(s):
     return s[~s.index.duplicated(keep="last")].sort_index()
 
 
+def _load_product(rid, target, cache, datecol, hourcol, dstcol, pub_cands, note):
+    """target 딜리버리일 행을 담은 문서를 발행일 후보 순서로 찾아 반환. (df, pub) 또는 (None, 사유)."""
+    tried = []
+    for pub in pub_cands:
+        d = pick_doc(mis_doc_list(rid, cache), pub)
+        if d is None:
+            tried.append(f"{pub}:없음")
+            continue
+        try:
+            df = mis_read_csv(d["DocID"])
+        except Exception as e:
+            tried.append(f"{pub}:읽기실패")
+            continue
+        if dstcol and dstcol in df.columns:
+            df = df[df[dstcol] == "N"]
+        try:
+            sel = df[pd.to_datetime(df[datecol], format="%m/%d/%Y") == pd.Timestamp(target)]
+        except Exception:
+            tried.append(f"{pub}:날짜파싱실패")
+            continue
+        if len(sel) >= 20:
+            return sel, str(pub)
+        tried.append(f"{pub}:행{len(sel)}")
+    return None, f"{note}[{','.join(tried)}]"
+
+
 def fetch_day_inputs(target, cache):
-    """딜리버리일=target 의 발행 예측치를 MIS에서 복원. 실패 시 None."""
-    pub = target - dt.timedelta(days=1)
+    """딜리버리일=target 의 발행 예측치를 MIS에서 복원.
+    발행일 후보: D-1(정석) → D(당일 발행분) → D-2 → D+1 순으로 시도.
+    성공 시 dict, 실패 시 ('사유 문자열') 반환."""
+    pubs = [target - dt.timedelta(days=1), target,
+            target - dt.timedelta(days=2), target + dt.timedelta(days=1)]
     out = {}
+    used = {}
 
-    d = pick_doc(mis_doc_list(RID["load_fcst"], cache), pub)
-    if d is None:
-        return None
-    df = mis_read_csv(d["DocID"])
-    df = df[df["DSTFlag"] == "N"]
-    sel = df[pd.to_datetime(df["DeliveryDate"], format="%m/%d/%Y") == pd.Timestamp(target)]
-    if len(sel) == 0:
-        return None
+    sel, info = _load_product(RID["load_fcst"], target, cache, "DeliveryDate", "HourEnding", "DSTFlag", pubs, "load_fcst")
+    if sel is None:
+        return info
+    used["load_fcst"] = info
     he = sel["HourEnding"].astype(str).str.split(":").str[0].astype(int)
-    out["lf_sys"] = dedup(pd.Series(sel["SystemTotal"].values,
-                                    index=pd.Timestamp(target) + pd.to_timedelta(he - 1, unit="h")))
+    out["lf_sys"] = dedup(pd.Series(pd.to_numeric(sel["SystemTotal"], errors="coerce").values,
+                                    index=pd.Timestamp(target) + pd.to_timedelta(he.values - 1, unit="h")))
 
-    d = pick_doc(mis_doc_list(RID["wind"], cache), pub)
-    if d is None:
-        return None
-    w = mis_read_csv(d["DocID"])
-    w = w[w["DSTFlag"] == "N"]
-    sel = w[pd.to_datetime(w["DELIVERY_DATE"], format="%m/%d/%Y") == pd.Timestamp(target)]
-    if len(sel) == 0:
-        return None
-    i2 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int) - 1, unit="h")
-    out["stwpf"] = dedup(pd.Series(sel["STWPF_SYSTEM_WIDE"].values, index=i2))
-    out["wgrpp"] = dedup(pd.Series(sel["WGRPP_SYSTEM_WIDE"].values, index=i2))
+    sel, info = _load_product(RID["wind"], target, cache, "DELIVERY_DATE", "HOUR_ENDING", "DSTFlag", pubs, "wind")
+    if sel is None:
+        return info
+    used["wind"] = info
+    i2 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int).values - 1, unit="h")
+    out["stwpf"] = dedup(pd.Series(pd.to_numeric(sel["STWPF_SYSTEM_WIDE"], errors="coerce").values, index=i2))
+    out["wgrpp"] = dedup(pd.Series(pd.to_numeric(sel["WGRPP_SYSTEM_WIDE"], errors="coerce").values, index=i2))
 
-    d = pick_doc(mis_doc_list(RID["solar"], cache), pub)
-    if d is None:
-        return None
-    s = mis_read_csv(d["DocID"])
-    s = s[s["DSTFlag"] == "N"]
-    sel = s[pd.to_datetime(s["DELIVERY_DATE"], format="%m/%d/%Y") == pd.Timestamp(target)]
-    if len(sel) == 0:
-        return None
-    i3 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int) - 1, unit="h")
-    out["stppf"] = dedup(pd.Series(sel["STPPF_SYSTEM_WIDE"].values, index=i3))
+    sel, info = _load_product(RID["solar"], target, cache, "DELIVERY_DATE", "HOUR_ENDING", "DSTFlag", pubs, "solar")
+    if sel is None:
+        return info
+    used["solar"] = info
+    i3 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int).values - 1, unit="h")
+    out["stppf"] = dedup(pd.Series(pd.to_numeric(sel["STPPF_SYSTEM_WIDE"], errors="coerce").values, index=i3))
 
-    d = pick_doc(mis_doc_list(RID["outage"], cache), pub)
-    if d is None:
-        return None
-    o = mis_read_csv(d["DocID"])
-    sel = o[pd.to_datetime(o["Date"], format="%m/%d/%Y") == pd.Timestamp(target)]
-    if len(sel) == 0:
-        return None
-    i4 = pd.Timestamp(target) + pd.to_timedelta(sel["HourEnding"].astype(int) - 1, unit="h")
-    tot = sel[["TotalResourceMWZoneSouth", "TotalResourceMWZoneNorth",
-               "TotalResourceMWZoneWest", "TotalResourceMWZoneHouston"]].sum(axis=1)
-    irr = sel[["TotalIRRMWZoneSouth", "TotalIRRMWZoneNorth",
-               "TotalIRRMWZoneWest", "TotalIRRMWZoneHouston"]].sum(axis=1)
-    out["outage_total"] = dedup(pd.Series(tot.values, index=i4))
-    out["outage_houston"] = dedup(pd.Series(sel["TotalResourceMWZoneHouston"].values, index=i4))
-    out["outage_irr"] = dedup(pd.Series(irr.values, index=i4))
+    sel, info = _load_product(RID["outage"], target, cache, "Date", "HourEnding", None, pubs, "outage")
+    if sel is None:
+        return info
+    used["outage"] = info
+    i4 = pd.Timestamp(target) + pd.to_timedelta(sel["HourEnding"].astype(int).values - 1, unit="h")
+    zc = ["TotalResourceMWZoneSouth", "TotalResourceMWZoneNorth",
+          "TotalResourceMWZoneWest", "TotalResourceMWZoneHouston"]
+    ic = ["TotalIRRMWZoneSouth", "TotalIRRMWZoneNorth",
+          "TotalIRRMWZoneWest", "TotalIRRMWZoneHouston"]
+    out["outage_total"] = dedup(pd.Series(sel[zc].apply(pd.to_numeric, errors="coerce").sum(axis=1).values, index=i4))
+    out["outage_houston"] = dedup(pd.Series(pd.to_numeric(sel["TotalResourceMWZoneHouston"], errors="coerce").values, index=i4))
+    out["outage_irr"] = dedup(pd.Series(sel[ic].apply(pd.to_numeric, errors="coerce").sum(axis=1).values, index=i4))
+    out["_pub_used"] = used
     return out
 
 
@@ -313,20 +330,58 @@ def build_features(target, inp, hist, eia, temps_now, temp_fcst_series):
     return f
 
 
+def _decide(ED, ps):
+    band = CFG["band"]
+    dec = np.where(ED < -band, "BUY_DA", np.where(ED > band, "BUY_RT", "NEUTRAL_5050"))
+    if CFG.get("spike_threshold"):
+        dec = np.where(np.asarray(ps) > CFG["spike_threshold"], "BUY_DA", dec)
+    return dec
+
+
 def predict_day(f):
+    """returns p3, ps, ED, dec, detail
+    detail: 앙상블 평균 전 개별 모델(시드별) 출력 원본"""
     F3 = f[CFG["features_3class"]].astype(float)
     FS = f[CFG["features_spike"]].astype(float)
     F3 = F3.fillna(F3.median())
     FS = FS.fillna(FS.median())
-    p3 = np.mean([b.predict(F3.values) for b in M3], axis=0)
-    ps = np.mean([b.predict(FS.values) for b in MS], axis=0)
+    seeds = CFG["seeds"]
+    p3_seed = {s: np.asarray(b.predict(F3.values)) for s, b in zip(seeds, M3)}
+    ps_seed = {s: np.asarray(b.predict(FS.values)).ravel() for s, b in zip(seeds, MS)}
+    p3 = np.mean([p3_seed[s] for s in seeds], axis=0)
+    ps = np.mean([ps_seed[s] for s in seeds], axis=0)
     mu = CFG["mu"]
     ED = p3[:, 0] * mu[0] + p3[:, 1] * mu[1] + p3[:, 2] * mu[2]
-    band = CFG["band"]
-    dec = np.where(ED < -band, "BUY_DA", np.where(ED > band, "BUY_RT", "NEUTRAL_5050"))
-    if CFG.get("spike_threshold"):
-        dec = np.where(ps > CFG["spike_threshold"], "BUY_DA", dec)
-    return p3, ps, ED, dec
+    dec = _decide(ED, ps)
+    return p3, ps, ED, dec, {"p3_seed": p3_seed, "ps_seed": ps_seed}
+
+
+def model_detail_rows(hrs, p3, ps, ED, dec, detail):
+    """시간당 1행: 시드별(개별 모델) 출력 + 앙상블 + 모델 간 합의도."""
+    mu, seeds = np.array(CFG["mu"], dtype=float), CFG["seeds"]
+    ed_seed = {s: (detail["p3_seed"][s] * mu).sum(axis=1) for s in seeds}
+    dec_seed = {s: _decide(ed_seed[s], detail["ps_seed"][s]) for s in seeds}
+    out = []
+    for i in range(len(hrs)):
+        row = {"dt_local": str(hrs[i]),
+               "ens_e_dart": round(float(ED[i]), 3),
+               "ens_decision": str(dec[i]),
+               "ens_p_spike": round(float(ps[i]), 4)}
+        for s in seeds:
+            row[f"m3_{s}_p_da"] = round(float(detail["p3_seed"][s][i, 0]), 4)
+            row[f"m3_{s}_p_rt"] = round(float(detail["p3_seed"][s][i, 2]), 4)
+            row[f"m3_{s}_e_dart"] = round(float(ed_seed[s][i]), 3)
+            row[f"m3_{s}_decision"] = str(dec_seed[s][i])
+            row[f"ms_{s}_p_spike"] = round(float(detail["ps_seed"][s][i]), 4)
+        eds = np.array([ed_seed[s][i] for s in seeds], dtype=float)
+        pss = np.array([detail["ps_seed"][s][i] for s in seeds], dtype=float)
+        row["agree_n"] = int(sum(1 for s in seeds if dec_seed[s][i] == dec[i]))
+        row["e_dart_std"] = round(float(eds.std(ddof=0)), 3)
+        row["e_dart_min"] = round(float(eds.min()), 3)
+        row["e_dart_max"] = round(float(eds.max()), 3)
+        row["p_spike_std"] = round(float(pss.std(ddof=0)), 4)
+        out.append(row)
+    return out
 
 
 def _r(s, t):
@@ -411,16 +466,17 @@ def _score(req: ScoreReq):
 
     eia = fetch_eia_actuals()
     cache = {}
-    preds_out, state_out, processed, skipped = [], [], [], []
+    preds_out, state_out, detail_out, processed, skipped = [], [], [], [], []
 
     for day in todo:
         try:
             from_state = day in state_days
             inp = inp_from_state(hist, day) if from_state else fetch_day_inputs(day, cache)
-            if inp is None:
+            if inp is None or isinstance(inp, str):
                 skipped.append({"day": day.isoformat(),
-                                "reason": "MIS 발행분 없음(보관기한 초과 또는 미발행)"})
+                                "reason": inp if isinstance(inp, str) else "state 값 부족"})
                 continue
+            pub_used = inp.pop("_pub_used", None)
 
             hrs = hours_of(day)
             tfs = None
@@ -436,10 +492,11 @@ def _score(req: ScoreReq):
             inp["temp_fcst"] = tfs
 
             f = build_features(day, inp, hist, eia, temps_now, tfs)
-            p3, ps, ED, dec = predict_day(f)
+            p3, ps, ED, dec, detail = predict_day(f)
 
             need_pred = (day.isoformat() not in have_pred) if req.have_pred_days is not None else True
             if need_pred or day == tomorrow:
+                detail_out.extend(model_detail_rows(hrs, p3, ps, ED, dec, detail))
                 for i in range(24):
                     preds_out.append({
                         "dt_local": str(hrs[i]),
@@ -462,7 +519,8 @@ def _score(req: ScoreReq):
 
             processed.append({"day": day.isoformat(),
                               "source": "state" if from_state else "mis",
-                              "state_written": not from_state})
+                              "state_written": not from_state,
+                              "pub_used": (pub_used if not from_state else None)})
         except Exception as e:
             skipped.append({"day": day.isoformat(), "reason": f"{type(e).__name__}: {e}"})
 
@@ -470,6 +528,7 @@ def _score(req: ScoreReq):
 
     return {
         "predictions": preds_out,
+        "model_detail": detail_out,
         "new_state": state_out,
         "settlements": settlements,
         "meta": {
@@ -478,6 +537,10 @@ def _score(req: ScoreReq):
             "processed_days": processed,
             "skipped_days": skipped,
             "backfilled_days": [p["day"] for p in processed if p["day"] != str(tomorrow)],
+            "state_days_in_sheet": sorted(str(d) for d in state_days),
+            "todo_days": [str(d) for d in todo],
+            "n_state_rows_returned": len(state_out),
+            "n_model_detail_rows": len(detail_out),
             "config": {k: CFG[k] for k in ("band", "spike_threshold", "trained_through")},
         },
     }
