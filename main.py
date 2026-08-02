@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v11: MIS 날짜/컬럼 파싱 내성 + /probe /peek 진단)
+(v12: MIS CSV/XML 문서 구분 — 백필 실패 근본원인 수정)
 
 POST /score
   body: {
@@ -68,20 +68,36 @@ def mis_doc_list(rid, cache):
     return docs
 
 
+def doc_fmt(d):
+    """MIS는 같은 리포트를 csv/xml 두 문서로 발행한다. 어느 쪽인지 판별."""
+    s = " ".join(str(d.get(k, "")) for k in ("FriendlyName", "FileName", "Extension")).lower()
+    if "xml" in s:
+        return "xml"
+    if "csv" in s:
+        return "csv"
+    return "?"
+
+
 def pick_doc(docs, pub_day, lo=6, hi=11):
-    """pub_day에 발행된 문서 중 lo~hi시 창의 마지막(가장 최신) 것."""
+    """pub_day 발행분 중 **CSV 문서**만 골라 lo~hi시 창의 최신 것."""
     same = [d for d in docs if str(d.get("PublishDate", ""))[:10] == pub_day.isoformat()]
     if not same:
         return None
-    win = [d for d in same if lo <= int(str(d["PublishDate"])[11:13]) <= hi]
-    pool = win or same
+    csvs = [d for d in same if doc_fmt(d) == "csv"]
+    if not csvs:
+        csvs = [d for d in same if doc_fmt(d) != "xml"]   # 판별 불가면 xml만 배제
+    pool = csvs or same
+    win = [d for d in pool if lo <= int(str(d["PublishDate"])[11:13]) <= hi]
+    pool = win or pool
     return sorted(pool, key=lambda d: d["PublishDate"])[-1]
 
 
 def mis_read_csv(docid):
     r = requests.get(MIS_DL.format(docid=docid), headers=UA, timeout=120)
     z = zipfile.ZipFile(io.BytesIO(r.content))
-    names = [n for n in z.namelist() if n.lower().endswith(".csv")] or z.namelist()
+    names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+    if not names:
+        raise ValueError("zip에CSV없음:" + ",".join(z.namelist()[:3]))
     df = pd.read_csv(io.BytesIO(z.read(names[0])))
     df.columns = [str(c).strip() for c in df.columns]
     return df
@@ -145,7 +161,7 @@ def _load_product(rid, target, cache, datecol, hourcol, dstcol, pub_cands, note)
         try:
             df = mis_read_csv(d["DocID"])
         except Exception as e:
-            tried.append(f"{pub}:읽기실패")
+            tried.append(f"{pub}:읽기실패({type(e).__name__}:{str(e)[:40]})")
             continue
         dc = _c(df, dstcol) if dstcol else None
         if dc:
@@ -505,15 +521,26 @@ def peek(product: str = "load_fcst", pub: str = ""):
     cache = {}
     docs = mis_doc_list(RID[product], cache)
     pubday = (dt.date.fromisoformat(pub) if pub else dt.datetime.now(CT).date())
+    same = [x for x in docs if str(x.get("PublishDate", ""))[:10] == pubday.isoformat()]
+    cands = [{"fmt": doc_fmt(x), "PublishDate": str(x.get("PublishDate")),
+              "FriendlyName": str(x.get("FriendlyName", ""))[:70], "DocID": x.get("DocID")}
+             for x in sorted(same, key=lambda x: str(x.get("PublishDate")))][-8:]
     d = pick_doc(docs, pubday)
     if d is None:
         return {"product": product, "pub": str(pubday), "error": "그 발행일 문서 없음",
+                "candidates_that_day": cands,
                 "available": sorted({str(x.get("PublishDate", ""))[:10] for x in docs} - {""})[-10:]}
-    df = mis_read_csv(d["DocID"])
+    try:
+        df = mis_read_csv(d["DocID"])
+    except Exception as e:
+        return {"product": product, "pub": str(pubday), "picked": doc_fmt(d),
+                "error": f"{type(e).__name__}: {e}", "candidates_that_day": cands}
     date_col = _c(df, "DeliveryDate", "DELIVERY_DATE", "Date", "OperDay", "OPR_DATE")
     dts = _parse_dates(df[date_col]) if date_col else None
     return {
-        "product": product, "pub_used": str(d.get("PublishDate")), "n_rows": int(len(df)),
+        "product": product, "pub_used": str(d.get("PublishDate")),
+        "picked_fmt": doc_fmt(d), "picked_name": str(d.get("FriendlyName", ""))[:80],
+        "candidates_that_day": cands, "n_rows": int(len(df)),
         "columns": [str(c) for c in df.columns],
         "date_col_found": date_col,
         "date_samples": [str(v) for v in df[date_col].head(3)] if date_col else None,
