@@ -47,6 +47,7 @@ RID = {"load_fcst": 12312, "wind": 13028, "solar": 13483, "outage": 13103,
 STATE_COLS = ["lf_sys", "stwpf", "wgrpp", "stppf", "temp_fcst",
               "outage_total", "outage_houston", "outage_irr"]
 
+VERSION = "v13"
 app = FastAPI()
 
 
@@ -468,7 +469,8 @@ def _r(s, t):
 # ---------------- endpoints ----------------
 @app.get("/health")
 def health():
-    return {"ok": True, "trained_through": CFG["trained_through"]}
+    return {"ok": True, "version": VERSION, "trained_through": CFG["trained_through"],
+            "endpoints": ["/health", "/probe?days=7", "/peek?product=&pub=", "POST /score"]}
 
 
 @app.get("/probe")

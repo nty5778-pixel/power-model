@@ -1,5 +1,16 @@
 # ERCOT DART 3-Class Scorer — 배포 가이드
 
+## 0. 배포 주소 (고정)
+```
+Render  : https://power-model.onrender.com
+  /health            헬스체크·웜업
+  /score   (POST)    일일 판정 + 백필
+  /probe?days=7      백필 가능일 진단
+  /peek?product=&pub= 원본 CSV 확인
+Sheet ID: 1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4
+```
+워크플로 JSON에 이 주소가 하드코딩되어 있으므로 임포트 후 URL 수정 불필요.
+
 ## 구성
 n8n(스케줄 08:30 CPT + Sheets I/O) → Render(FastAPI 스코어러, 무상태) → Google Sheets "ERCOT DART Tracker"
 
@@ -9,7 +20,7 @@ n8n(스케줄 08:30 CPT + Sheets I/O) → Render(FastAPI 스코어러, 무상태
    - Build: `pip install -r requirements.txt`
    - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
    - 환경변수: `EIA_API_KEY` = (EIA v2 키)
-3. 확인: `GET https://<your-app>.onrender.com/health`
+3. 확인: `GET https://power-model.onrender.com/health`  (현재 배포 주소)
    - 주의: Render 무료 플랜은 슬립 → n8n HTTP 노드 타임아웃을 120s+로, 또는 08:25에 /health 웜업 호출 추가
 
 ## 2. Google Sheet ("ERCOT DART Tracker", 생성됨)
@@ -20,8 +31,8 @@ n8n(스케줄 08:30 CPT + Sheets I/O) → Render(FastAPI 스코어러, 무상태
 - `actuals`: dt_local, da_spp, rt_spp, dart
 
 ## 3. n8n 워크플로 (dart_daily_workflow.json 임포트)
-흐름: Schedule(08:30 America/Chicago) → [웜업 /health] → Sheets Read(state 탭 전체) →
-HTTP POST `<render>/score` (body: {"state": rows}) → 분기 3개:
+흐름: Schedule(08:30 America/Chicago) → 웜업 `/health` → Sheets batchGet 1회 →
+HTTP POST `https://power-model.onrender.com/score` (body: {"state": rows}) → 분기 3개:
   predictions[] → Sheets Append(predictions)
   new_state[] → Sheets Append(state)
   settlements[] → Sheets Append(actuals)  ※ 중복 append 가능 — 시트에서 dt_local 기준 중복 제거하거나 n8n에서 기존 actuals 마지막 dt 이후만 필터
@@ -218,3 +229,43 @@ https://power-model.onrender.com/probe?days=7
 ### 기존 오염된 행 정리
 이미 들어간 중복·부분값은 자동으로 고쳐지지 않는다(그 시각은 이제 `have_actual_hours`에 포함되어 스킵됨).
 `actuals` 탭을 **헤더만 남기고 비운 뒤** 워크플로를 1회 수동 실행하면 MIS 보관분 범위 내에서 깨끗하게 재구축된다.
+
+## 14. 쿼터 초과 2차 — 읽기 노드가 아이템마다 실행 (워크플로 v11)
+
+`Read headers`에서 쿼터가 났지만 범인은 그 노드가 아니다(호출 1회). 위쪽 읽기 노드들이었다.
+
+**n8n 노드는 기본적으로 입력 아이템마다 한 번씩 실행된다.**
+`Read state tab`이 720행 = 720 아이템을 뱉으면 → `Read predictions (days)`가 **720번** 실행 →
+그 출력이 다시 `Read actuals (days)`로 들어가 **수백 번** 더. 분당 60회 한도를 즉시 초과하고,
+소진된 상태에서 `Read headers`가 마지막에 걸려 그 노드 이름으로 에러가 표시된 것뿐이다.
+
+**v11 해결**: Sheets 읽기를 전부 `values:batchGet` **1회**로 통합. 노드 3개(+헤더노드) → 1개.
+
+읽는 range 9개 (순서 고정)
+```
+0 state!A:Z          3 predictions!1:1     6 actuals!1:1
+1 predictions!A:A    4 model_detail!1:1    7 daily_summary!1:1
+2 actuals!A:A        5 state!1:1           8 runlog!1:1
+```
+`Pack payload`가 0~2를, `Build appends`가 3~8(헤더)을 사용한다.
+`valueRenderOption=UNFORMATTED_VALUE`로 숫자를 문자열이 아닌 숫자로 받는다.
+
+| | v8 | v9 | **v11** |
+|---|---|---|---|
+| 노드 수 | 24 | 15 | **12** |
+| Sheets API 호출/실행 | 수백~수천 | 읽기 4 + 쓰기 ≤6 | **읽기 1 + 쓰기 ≤6 = 7** |
+
+부수 효과
+- 모든 중간 노드에 `executeOnce: true` → 아이템 수와 무관하게 1회 실행 보장
+  (`Append rows (batch)`만 예외 — 탭당 1회 실행해야 하므로)
+- `Pack payload`가 state 192행 미만이면 명확한 메시지로 즉시 실패 (예전엔 Render에서 400)
+- 재임포트 시 두 HTTP 노드(`Read sheets (1 call)`, `Append rows (batch)`)에
+  **Predefined Credential Type → Google Sheets OAuth2 API** 연결 필요
+
+## 15. 배포 버전 확인
+```
+GET https://power-model.onrender.com/health
+→ {"ok":true,"version":"v13","trained_through":"2026-07-25 18:00:00", ...}
+```
+`version`이 기대값과 다르면 Render가 아직 이전 커밋을 돌리고 있는 것 —
+Render 대시보드에서 Manual Deploy → Deploy latest commit.

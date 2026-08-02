@@ -1,5 +1,5 @@
 {
-  "name": "ERCOT DART Daily (v9: batch append, quota-safe)",
+  "name": "ERCOT DART Daily (v11: Sheets 읽기 1회)",
   "nodes": [
     {
       "parameters": {
@@ -24,7 +24,7 @@
     },
     {
       "parameters": {
-        "url": "https://YOUR-RENDER-APP.onrender.com/health",
+        "url": "https://power-model.onrender.com/health",
         "options": {
           "timeout": 60000
         }
@@ -45,45 +45,8 @@
     },
     {
       "parameters": {
-        "operation": "read",
-        "documentId": {
-          "__rl": true,
-          "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4",
-          "mode": "id"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": "state",
-          "mode": "name"
-        },
-        "options": {}
-      },
-      "id": "read_state",
-      "name": "Read state tab",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [
-        400,
-        0
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "const state = $('Read state tab').all().map(i=>i.json).slice(-720);\nconst wm = $('Fetch Open-Meteo').first().json;\nlet wp = null;\ntry { const p = $('Fetch Open-Meteo prev').first().json; wp = p && p.hourly ? p.hourly : null; } catch(e) { wp = null; }\nconst dayOf = r => String(r.dt_local||'').slice(0,10);\nlet predDays = [], actDays = [];\ntry { predDays = [...new Set($('Read predictions (days)').all().map(i=>dayOf(i.json)).filter(Boolean))]; } catch(e) {}\ntry { actDays  = [...new Set($('Read actuals (days)').all().map(i=>dayOf(i.json)).filter(Boolean))]; } catch(e) {}\nreturn [{ json: { state, weather: wm.hourly || null, weather_prev: wp,\n                  have_pred_days: predDays, have_actual_days: actDays, max_backfill_days: 7 } }];"
-      },
-      "id": "pack_state",
-      "name": "Pack payload",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        600,
-        0
-      ]
-    },
-    {
-      "parameters": {
         "method": "POST",
-        "url": "https://YOUR-RENDER-APP.onrender.com/score",
+        "url": "https://power-model.onrender.com/score",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ state: $json.state, weather: $json.weather, weather_prev: $json.weather_prev, have_pred_days: $json.have_pred_days, have_actual_days: $json.have_actual_days, max_backfill_days: $json.max_backfill_days }) }}",
@@ -101,7 +64,8 @@
       ],
       "retryOnFail": true,
       "maxTries": 3,
-      "waitBetweenTries": 30000
+      "waitBetweenTries": 30000,
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -134,7 +98,8 @@
       "position": [
         1000,
         300
-      ]
+      ],
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -173,7 +138,8 @@
       "notes": "크리덴셜: Header Auth (x-api-key = Anthropic API 키) — 주간 분석과 동일 크리덴셜",
       "onError": "continueRegularOutput",
       "retryOnFail": true,
-      "maxTries": 2
+      "maxTries": 2,
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -195,56 +161,6 @@
     },
     {
       "parameters": {
-        "operation": "read",
-        "documentId": {
-          "__rl": true,
-          "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4",
-          "mode": "id"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": "predictions",
-          "mode": "name"
-        },
-        "options": {}
-      },
-      "id": "read_preds_days",
-      "name": "Read predictions (days)",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [
-        400,
-        -160
-      ],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
-        "operation": "read",
-        "documentId": {
-          "__rl": true,
-          "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4",
-          "mode": "id"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": "actuals",
-          "mode": "name"
-        },
-        "options": {}
-      },
-      "id": "read_act_days",
-      "name": "Read actuals (days)",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [
-        400,
-        160
-      ],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
         "amount": 20,
         "unit": "seconds"
       },
@@ -257,38 +173,6 @@
         0
       ],
       "webhookId": "dart-wait-boot"
-    },
-    {
-      "parameters": {
-        "url": "https://sheets.googleapis.com/v4/spreadsheets/1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4/values:batchGet?ranges=predictions!1:1&ranges=model_detail!1:1&ranges=state!1:1&ranges=actuals!1:1&ranges=daily_summary!1:1&ranges=runlog!1:1&majorDimension=ROWS",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googleSheetsOAuth2Api",
-        "options": {
-          "timeout": 60000
-        }
-      },
-      "id": "read_headers",
-      "name": "Read headers (1 call)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1400,
-        300
-      ],
-      "notes": "6개 탭 헤더를 batchGet 1회로 읽음 (기존: 행당 1회 → 쿼터 초과)"
-    },
-    {
-      "parameters": {
-        "jsCode": "\n// /score 결과 + Claude 요약을 시트 헤더 순서에 맞춰 탭별 2차원 배열로 패킹.\n// 목적: Append를 탭당 1회 API 호출로 줄여 Sheets 읽기 쿼터(60/min) 초과를 제거.\nconst TABS = [\"predictions\",\"model_detail\",\"state\",\"actuals\",\"daily_summary\",\"runlog\"];\nconst hdrResp = $input.first().json;\nconst ranges = hdrResp.valueRanges || [];\nconst H = {};\nTABS.forEach((t,i) => { H[t] = ((ranges[i]||{}).values||[[]])[0] || []; });\n\nconst r = $('POST /score').first().json;\nconst m = r.meta;\nconst gen = m.generated_at;\n\nconst rows = {};\nrows.predictions  = (r.predictions  || []).map(o => ({...o, generated_at: gen}));\nrows.model_detail = (r.model_detail || []).map(o => ({...o, generated_at: gen}));\nrows.state        = (r.new_state    || []);\nrows.actuals      = (r.settlements  || []);\n\n// daily_summary\nlet summary = [];\ntry {\n  const resp = $('Claude 일일 요약').first().json;\n  const txt = (resp.content && resp.content[0] && resp.content[0].text) ? resp.content[0].text\n            : JSON.stringify(resp).slice(0,500);\n  const c = $('Prep Claude input').first().json;\n  summary = [{ run_at: gen, target_day: c.target_day, n_da: c.nDA, n_neutral: c.nNEU, n_rt: c.nRT,\n               max_p_spike: c.maxSpike, low_agree_hours: c.lowAgree ?? '', avg_e_dart_std: c.avgStd ?? '',\n               backfilled: c.backfilled, claude_summary: txt }];\n} catch (e) { summary = []; }\nrows.daily_summary = summary;\n\nrows.runlog = [{\n  run_at: gen, target_day: m.target_day,\n  todo_days: (m.todo_days||[]).join(','),\n  processed: (m.processed_days||[]).map(p=>`${p.day}:${p.source}${p.state_written?'+state':''}`).join(' | '),\n  skipped:   (m.skipped_days||[]).map(s=>`${s.day}:${s.reason}`).join(' | '),\n  backfilled: (m.backfilled_days||[]).join(','),\n  state_rows_returned: m.n_state_rows_returned,\n  state_days_in_sheet: (m.state_days_in_sheet||[]).join(','),\n  model_detail_rows: m.n_model_detail_rows\n}];\n\nconst out = [];\nfor (const t of TABS) {\n  const data = rows[t] || [];\n  if (!data.length) continue;\n  const hdr = H[t];\n  if (!hdr.length) { out.push({ json: { tab: t, values: [], skipped: 'header missing' } }); continue; }\n  const values = data.map(o => hdr.map(h => {\n    const v = o[h];\n    return (v === undefined || v === null || (typeof v === 'number' && !isFinite(v))) ? '' : v;\n  }));\n  out.push({ json: { tab: t, values, n: values.length } });\n}\nif (!out.length) return [{ json: { tab: 'runlog', values: [], n: 0 } }];\nreturn out;\n"
-      },
-      "id": "build_appends",
-      "name": "Build appends",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1600,
-        300
-      ]
     },
     {
       "parameters": {
@@ -326,6 +210,57 @@
       "maxTries": 3,
       "waitBetweenTries": 5000,
       "notes": "탭당 1회. 총 API 호출 = 헤더읽기 1 + 탭수(<=6)"
+    },
+    {
+      "parameters": {
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4/values:batchGet?ranges=state!A:Z&ranges=predictions!A:A&ranges=actuals!A:A&ranges=predictions!1:1&ranges=model_detail!1:1&ranges=state!1:1&ranges=actuals!1:1&ranges=daily_summary!1:1&ranges=runlog!1:1&majorDimension=ROWS&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "read_sheets",
+      "name": "Read sheets (1 call)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        400,
+        0
+      ],
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "notes": "state 전체 + predictions/actuals의 dt_local + 6개 탭 헤더를 batchGet 1회로 읽음.\n기존: Sheets 노드 3개가 아이템마다 실행되어 읽기 수백 회 → 쿼터 초과"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// batchGet 결과 파싱: 0=state전체, 1=predictions dt_local, 2=actuals dt_local, 3~8=탭 헤더\nconst vr = ($input.first().json.valueRanges) || [];\nconst rows = i => ((vr[i] || {}).values) || [];\n\nfunction toObjects(vals) {\n  if (!vals.length) return [];\n  const hdr = vals[0].map(h => String(h).trim());\n  return vals.slice(1).map(r => {\n    const o = {};\n    hdr.forEach((h, j) => { o[h] = (r[j] === undefined || r[j] === '') ? null : r[j]; });\n    return o;\n  });\n}\nconst state = toObjects(rows(0)).filter(r => r.dt_local).slice(-720);\nif (state.length < 192) {\n  throw new Error(`state 행 부족: ${state.length} (192 이상 필요). state 탭/헤더 확인`);\n}\nconst col = i => rows(i).slice(1).map(r => String(r[0] || '')).filter(Boolean);\nconst predDays  = [...new Set(col(1).map(s => s.slice(0, 10)))];\nconst actHours  = [...new Set(col(2))].slice(-2000);\n\nconst wm = $('Fetch Open-Meteo').first().json;\nlet wp = null;\ntry { const p = $('Fetch Open-Meteo prev').first().json; wp = (p && p.hourly) ? p.hourly : null; } catch (e) {}\n\nreturn [{ json: {\n  state, weather: wm.hourly || null, weather_prev: wp,\n  have_pred_days: predDays, have_actual_hours: actHours, max_backfill_days: 7,\n  _n: { state: state.length, predDays: predDays.length, actHours: actHours.length }\n} }];\n"
+      },
+      "id": "pack_state",
+      "name": "Pack payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        0
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst TABS = [\"predictions\",\"model_detail\",\"state\",\"actuals\",\"daily_summary\",\"runlog\"];\nconst vr = $('Read sheets (1 call)').first().json.valueRanges || [];\nconst H = {};\nTABS.forEach((t, i) => { H[t] = (((vr[i + 3] || {}).values) || [[]])[0] || []; });\n\nconst r = $('POST /score').first().json;\nconst m = r.meta, gen = m.generated_at;\n\nconst rows = {};\nrows.predictions  = (r.predictions  || []).map(o => ({ ...o, generated_at: gen }));\nrows.model_detail = (r.model_detail || []).map(o => ({ ...o, generated_at: gen }));\nrows.state        = (r.new_state    || []);\nrows.actuals      = (r.settlements  || []);\n\nlet summary = [];\ntry {\n  const resp = $('Claude 일일 요약').first().json;\n  const txt = (resp.content && resp.content[0] && resp.content[0].text) ? resp.content[0].text\n            : JSON.stringify(resp).slice(0, 500);\n  const c = $('Prep Claude input').first().json;\n  summary = [{ run_at: gen, target_day: c.target_day, n_da: c.nDA, n_neutral: c.nNEU, n_rt: c.nRT,\n               max_p_spike: c.maxSpike, low_agree_hours: c.lowAgree ?? '', avg_e_dart_std: c.avgStd ?? '',\n               backfilled: c.backfilled, claude_summary: txt }];\n} catch (e) {}\nrows.daily_summary = summary;\n\nrows.runlog = [{\n  run_at: gen, target_day: m.target_day,\n  todo_days: (m.todo_days || []).join(','),\n  processed: (m.processed_days || []).map(p => `${p.day}:${p.source}${p.state_written ? '+state' : ''}`).join(' | '),\n  skipped:   (m.skipped_days || []).map(s => `${s.day}:${s.reason}`).join(' | '),\n  backfilled: (m.backfilled_days || []).join(','),\n  state_rows_returned: m.n_state_rows_returned,\n  state_days_in_sheet: (m.state_days_in_sheet || []).join(','),\n  model_detail_rows: m.n_model_detail_rows\n}];\n\nconst out = [];\nfor (const t of TABS) {\n  const data = rows[t] || [];\n  if (!data.length) continue;\n  const hdr = H[t];\n  if (!hdr.length) continue;\n  const values = data.map(o => hdr.map(h => {\n    const v = o[String(h).trim()];\n    return (v === undefined || v === null || (typeof v === 'number' && !isFinite(v))) ? '' : v;\n  }));\n  out.push({ json: { tab: t, values, n: values.length } });\n}\nreturn out.length ? out : [{ json: { tab: 'runlog', values: [], n: 0 } }];\n"
+      },
+      "id": "build_appends",
+      "name": "Build appends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        0
+      ],
+      "executeOnce": true
     }
   ],
   "connections": {
@@ -351,22 +286,11 @@
         ]
       ]
     },
-    "Read state tab": {
+    "Wait 20s (boot)": {
       "main": [
         [
           {
-            "node": "Read predictions (days)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "POST /score": {
-      "main": [
-        [
-          {
-            "node": "Prep Claude input",
+            "node": "Fetch Open-Meteo",
             "type": "main",
             "index": 0
           }
@@ -384,51 +308,18 @@
         ]
       ]
     },
-    "Prep Claude input": {
-      "main": [
-        [
-          {
-            "node": "Claude 일일 요약",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Claude 일일 요약": {
-      "main": [
-        [
-          {
-            "node": "Read headers (1 call)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Fetch Open-Meteo prev": {
       "main": [
         [
           {
-            "node": "Read state tab",
+            "node": "Read sheets (1 call)",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Read predictions (days)": {
-      "main": [
-        [
-          {
-            "node": "Read actuals (days)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Read actuals (days)": {
+    "Read sheets (1 call)": {
       "main": [
         [
           {
@@ -450,18 +341,29 @@
         ]
       ]
     },
-    "Wait 20s (boot)": {
+    "POST /score": {
       "main": [
         [
           {
-            "node": "Fetch Open-Meteo",
+            "node": "Prep Claude input",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Read headers (1 call)": {
+    "Prep Claude input": {
+      "main": [
+        [
+          {
+            "node": "Claude 일일 요약",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude 일일 요약": {
       "main": [
         [
           {
