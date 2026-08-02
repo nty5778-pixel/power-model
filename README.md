@@ -137,3 +137,36 @@ state·날씨 없이 ERCOT MIS만 조회해서 상품 4종(load_fcst, wind, sola
 1. `POST /score` 노드 출력에서 `meta.skipped_days` / `meta.todo_days` 확인 — Split이 비는 건 결과이지 원인이 아님
 2. 워크플로 v9를 임포트했다면 Split 노드는 존재하지 않는다. 화면에 Split이 보이면 아직 v8이므로 v9로 교체
 3. 그래도 비면 `/probe` 결과를 그대로 공유
+
+## 11. 백필이 안 되던 진짜 원인 — MIS 날짜 파싱 (v11에서 수정)
+
+`/probe` 실측 결과 (2026-08-02 00:44 CT 실행):
+```
+load_fcst[2026-08-02:날짜파싱실패, 2026-08-03:없음, 2026-08-01:날짜파싱실패, ...]
+outage   [2026-08-02:날짜파싱실패, ...]
+```
+문서는 **있는데** 읽고 나서 날짜 컬럼 파싱에서 깨지고 있었다.
+v10까지는 `pd.to_datetime(df[col], format="%m/%d/%Y")` 로 **한 가지 포맷만** 시도했고,
+포맷이 안 맞으면 예외 → 그 발행일을 통째로 스킵 → 후보 4개 전부 실패 → 그날 예측 없음.
+"내일치도 없고 백필도 안 되던" 증상이 전부 이 한 줄에서 나왔다.
+
+v11 수정
+- `_parse_dates()` — `MM/DD/YYYY` → `YYYY-MM-DD` → 자동추론 순으로 시도, 전부 NaT일 때만 실패 처리
+- `_c()` — 컬럼명 대소문자·언더스코어·공백 차이를 흡수 (`DELIVERY_DATE` == `DeliveryDate`)
+- `_hours()` — `01:00` / `1` / `24:00` / 정수 모두 허용
+- `mis_read_csv()` — zip 안에서 `.csv`를 골라 읽고 컬럼명 공백 제거
+- 실패 사유가 구체화됨: `날짜파싱실패(col=DeliveryDate,예='2026-08-03')`,
+  `행0(문서범위 2026-08-01~2026-08-07)` — 문서에 어느 날짜들이 들어있는지까지 표시
+
+### 백필 확인 방법
+```
+https://power-model.onrender.com/probe?days=7
+```
+→ `recoverable_days` 에 나온 날짜만 백필 가능. MIS 보관 7일 밖은 영구 복원 불가(정상).
+
+### 그래도 파싱이 실패하면
+```
+https://power-model.onrender.com/peek?product=wind&pub=2026-08-01
+```
+원본 CSV의 컬럼명 전체, 날짜 컬럼 샘플값, 문서에 들어있는 딜리버리일 목록, 샘플 2행을 그대로 보여준다.
+product: load_fcst | wind | solar | outage | dam_spp_daily | rtm_spp_daily

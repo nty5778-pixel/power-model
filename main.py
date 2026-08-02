@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v9: 개별 모델(시드별) 출력 model_detail 추가)
+(v11: MIS 날짜/컬럼 파싱 내성 + /probe /peek 진단)
 
 POST /score
   body: {
@@ -81,7 +81,39 @@ def pick_doc(docs, pub_day, lo=6, hi=11):
 def mis_read_csv(docid):
     r = requests.get(MIS_DL.format(docid=docid), headers=UA, timeout=120)
     z = zipfile.ZipFile(io.BytesIO(r.content))
-    return pd.read_csv(io.BytesIO(z.read(z.namelist()[0])))
+    names = [n for n in z.namelist() if n.lower().endswith(".csv")] or z.namelist()
+    df = pd.read_csv(io.BytesIO(z.read(names[0])))
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _c(df, *names):
+    """컬럼명 대소문자·언더스코어·공백 차이를 흡수해서 실제 컬럼명을 찾는다."""
+    norm = {str(c).strip().lower().replace("_", "").replace(" ", ""): c for c in df.columns}
+    for n in names:
+        k = str(n).strip().lower().replace("_", "").replace(" ", "")
+        if k in norm:
+            return norm[k]
+    return None
+
+
+def _parse_dates(s):
+    """ERCOT은 MM/DD/YYYY 와 YYYY-MM-DD 를 모두 쓴다. 둘 다 받아준다."""
+    for kw in ({"format": "%m/%d/%Y"}, {"format": "%Y-%m-%d"}, {}):
+        try:
+            d = pd.to_datetime(s, errors="coerce", **kw)
+        except Exception:
+            continue
+        if d.notna().any():
+            return d.dt.normalize()
+    return pd.Series(pd.NaT, index=s.index)
+
+
+def _hours(s):
+    """HourEnding: '01:00' / '1' / 1 / '24:00' 모두 → 0-base 시작시각."""
+    v = s.astype(str).str.strip().str.split(":").str[0]
+    v = pd.to_numeric(v, errors="coerce")
+    return v - 1
 
 
 def hours_of(day):
@@ -115,16 +147,23 @@ def _load_product(rid, target, cache, datecol, hourcol, dstcol, pub_cands, note)
         except Exception as e:
             tried.append(f"{pub}:읽기실패")
             continue
-        if dstcol and dstcol in df.columns:
-            df = df[df[dstcol] == "N"]
-        try:
-            sel = df[pd.to_datetime(df[datecol], format="%m/%d/%Y") == pd.Timestamp(target)]
-        except Exception:
-            tried.append(f"{pub}:날짜파싱실패")
+        dc = _c(df, dstcol) if dstcol else None
+        if dc:
+            df = df[df[dc].astype(str).str.upper().str.startswith("N")]
+        col = _c(df, datecol, "DeliveryDate", "DELIVERY_DATE", "Date", "OperDay", "OPR_DATE")
+        if col is None:
+            tried.append(f"{pub}:컬럼없음({'|'.join(map(str, df.columns[:6]))})")
             continue
+        dts = _parse_dates(df[col])
+        if dts.isna().all():
+            samp = str(df[col].iloc[0])[:20] if len(df) else ""
+            tried.append(f"{pub}:날짜파싱실패(col={col},예='{samp}')")
+            continue
+        sel = df[dts == pd.Timestamp(target)]
         if len(sel) >= 20:
             return sel, str(pub)
-        tried.append(f"{pub}:행{len(sel)}")
+        rng = f"{dts.min().date()}~{dts.max().date()}" if dts.notna().any() else "?"
+        tried.append(f"{pub}:행{len(sel)}(문서범위 {rng})")
     return None, f"{note}[{','.join(tried)}]"
 
 
@@ -137,40 +176,40 @@ def fetch_day_inputs(target, cache):
     out = {}
     used = {}
 
-    sel, info = _load_product(RID["load_fcst"], target, cache, "DeliveryDate", "HourEnding", "DSTFlag", pubs, "load_fcst")
+    sel, info = _load_product(RID["load_fcst"], target, cache, "DeliveryDate", None, "DSTFlag", pubs, "load_fcst")
     if sel is None:
         return info
     used["load_fcst"] = info
-    he = sel["HourEnding"].astype(str).str.split(":").str[0].astype(int)
-    out["lf_sys"] = dedup(pd.Series(pd.to_numeric(sel["SystemTotal"], errors="coerce").values,
-                                    index=pd.Timestamp(target) + pd.to_timedelta(he.values - 1, unit="h")))
+    i1 = pd.Timestamp(target) + pd.to_timedelta(_hours(sel[_c(sel, "HourEnding", "HOUR_ENDING")]).values, unit="h")
+    lfc = _c(sel, "SystemTotal", "SYSTEM_TOTAL", "SystemWide")
+    out["lf_sys"] = dedup(pd.Series(pd.to_numeric(sel[lfc], errors="coerce").values, index=i1))
 
-    sel, info = _load_product(RID["wind"], target, cache, "DELIVERY_DATE", "HOUR_ENDING", "DSTFlag", pubs, "wind")
+    sel, info = _load_product(RID["wind"], target, cache, "DELIVERY_DATE", None, "DSTFlag", pubs, "wind")
     if sel is None:
         return info
     used["wind"] = info
-    i2 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int).values - 1, unit="h")
-    out["stwpf"] = dedup(pd.Series(pd.to_numeric(sel["STWPF_SYSTEM_WIDE"], errors="coerce").values, index=i2))
-    out["wgrpp"] = dedup(pd.Series(pd.to_numeric(sel["WGRPP_SYSTEM_WIDE"], errors="coerce").values, index=i2))
+    i2 = pd.Timestamp(target) + pd.to_timedelta(_hours(sel[_c(sel, "HOUR_ENDING", "HourEnding")]).values, unit="h")
+    out["stwpf"] = dedup(pd.Series(pd.to_numeric(sel[_c(sel, "STWPF_SYSTEM_WIDE")], errors="coerce").values, index=i2))
+    out["wgrpp"] = dedup(pd.Series(pd.to_numeric(sel[_c(sel, "WGRPP_SYSTEM_WIDE")], errors="coerce").values, index=i2))
 
-    sel, info = _load_product(RID["solar"], target, cache, "DELIVERY_DATE", "HOUR_ENDING", "DSTFlag", pubs, "solar")
+    sel, info = _load_product(RID["solar"], target, cache, "DELIVERY_DATE", None, "DSTFlag", pubs, "solar")
     if sel is None:
         return info
     used["solar"] = info
-    i3 = pd.Timestamp(target) + pd.to_timedelta(sel["HOUR_ENDING"].astype(int).values - 1, unit="h")
-    out["stppf"] = dedup(pd.Series(pd.to_numeric(sel["STPPF_SYSTEM_WIDE"], errors="coerce").values, index=i3))
+    i3 = pd.Timestamp(target) + pd.to_timedelta(_hours(sel[_c(sel, "HOUR_ENDING", "HourEnding")]).values, unit="h")
+    out["stppf"] = dedup(pd.Series(pd.to_numeric(sel[_c(sel, "STPPF_SYSTEM_WIDE")], errors="coerce").values, index=i3))
 
-    sel, info = _load_product(RID["outage"], target, cache, "Date", "HourEnding", None, pubs, "outage")
+    sel, info = _load_product(RID["outage"], target, cache, "Date", None, None, pubs, "outage")
     if sel is None:
         return info
     used["outage"] = info
-    i4 = pd.Timestamp(target) + pd.to_timedelta(sel["HourEnding"].astype(int).values - 1, unit="h")
-    zc = ["TotalResourceMWZoneSouth", "TotalResourceMWZoneNorth",
-          "TotalResourceMWZoneWest", "TotalResourceMWZoneHouston"]
-    ic = ["TotalIRRMWZoneSouth", "TotalIRRMWZoneNorth",
-          "TotalIRRMWZoneWest", "TotalIRRMWZoneHouston"]
+    i4 = pd.Timestamp(target) + pd.to_timedelta(_hours(sel[_c(sel, "HourEnding", "HOUR_ENDING")]).values, unit="h")
+    zc = [_c(sel, f"TotalResourceMWZone{z}") for z in ("South", "North", "West", "Houston")]
+    ic = [_c(sel, f"TotalIRRMWZone{z}") for z in ("South", "North", "West", "Houston")]
+    zc = [c for c in zc if c]; ic = [c for c in ic if c]
     out["outage_total"] = dedup(pd.Series(sel[zc].apply(pd.to_numeric, errors="coerce").sum(axis=1).values, index=i4))
-    out["outage_houston"] = dedup(pd.Series(pd.to_numeric(sel["TotalResourceMWZoneHouston"], errors="coerce").values, index=i4))
+    hc = _c(sel, "TotalResourceMWZoneHouston")
+    out["outage_houston"] = dedup(pd.Series(pd.to_numeric(sel[hc], errors="coerce").values, index=i4))
     out["outage_irr"] = dedup(pd.Series(sel[ic].apply(pd.to_numeric, errors="coerce").sum(axis=1).values, index=i4))
     out["_pub_used"] = used
     return out
@@ -399,16 +438,33 @@ def health():
 
 
 @app.get("/probe")
-def probe(day: str = ""):
+def probe(day: str = "", days: int = 0):
     """브라우저에서 바로 열어보는 진단용. state 없이 MIS만 확인한다.
-    예) https://<app>.onrender.com/probe            → 내일치
-        https://<app>.onrender.com/probe?day=2026-08-02
+    예) /probe                    → 내일치
+        /probe?day=2026-08-02     → 특정일
+        /probe?days=7             → 백필 대상 전체(어제부터 과거 N일 + 내일) 한 번에
     """
     now = dt.datetime.now(CT)
-    target = (dt.date.fromisoformat(day) if day
-              else (now + dt.timedelta(days=1)).date())
-    cache = {}
-    out = {"now_ct": str(now), "target_day": str(target), "products": {}}
+    if days:
+        tomorrow = (now + dt.timedelta(days=1)).date()
+        targets = [tomorrow] + [tomorrow - dt.timedelta(days=k) for k in range(1, days + 1)]
+        cache = {}
+        res = {}
+        for t in sorted(targets):
+            r = _probe_one(t, cache)
+            res[str(t)] = {"all_ok": r["all_ok"],
+                           "detail": {k: (v.get("pub_used") or v.get("reason") or v.get("error"))
+                                      for k, v in r["products"].items()}}
+        ok = [d for d, v in res.items() if v["all_ok"]]
+        return {"now_ct": str(now), "window_days": days, "recoverable_days": ok,
+                "n_recoverable": len(ok), "by_day": res,
+                "hint": "recoverable_days 에 있는 날짜만 백필 가능. 나머지는 MIS 7일 보관 한도 밖이거나 미발행"}
+    target = (dt.date.fromisoformat(day) if day else (now + dt.timedelta(days=1)).date())
+    return {"now_ct": str(now), **_probe_one(target, {})}
+
+
+def _probe_one(target, cache):
+    out = {"target_day": str(target), "products": {}}
     pubs = [target - dt.timedelta(days=1), target,
             target - dt.timedelta(days=2), target + dt.timedelta(days=1)]
     spec = {
@@ -437,6 +493,34 @@ def probe(day: str = ""):
                    if out["all_ok"] else
                    "위 reason이 그날 예측이 비는 직접 원인. MIS 미발행이면 시간을 늦춰 재실행")
     return out
+
+
+@app.get("/peek")
+def peek(product: str = "load_fcst", pub: str = ""):
+    """원본 CSV의 컬럼명과 샘플 2행을 그대로 보여준다 (파싱이 계속 실패할 때).
+    예) /peek?product=wind&pub=2026-08-01
+    """
+    if product not in RID:
+        return {"error": f"product must be one of {list(RID)}"}
+    cache = {}
+    docs = mis_doc_list(RID[product], cache)
+    pubday = (dt.date.fromisoformat(pub) if pub else dt.datetime.now(CT).date())
+    d = pick_doc(docs, pubday)
+    if d is None:
+        return {"product": product, "pub": str(pubday), "error": "그 발행일 문서 없음",
+                "available": sorted({str(x.get("PublishDate", ""))[:10] for x in docs} - {""})[-10:]}
+    df = mis_read_csv(d["DocID"])
+    date_col = _c(df, "DeliveryDate", "DELIVERY_DATE", "Date", "OperDay", "OPR_DATE")
+    dts = _parse_dates(df[date_col]) if date_col else None
+    return {
+        "product": product, "pub_used": str(d.get("PublishDate")), "n_rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "date_col_found": date_col,
+        "date_samples": [str(v) for v in df[date_col].head(3)] if date_col else None,
+        "delivery_days_in_doc": (sorted({str(x.date()) for x in dts.dropna().unique()})
+                                 if dts is not None and dts.notna().any() else None),
+        "sample_rows": json.loads(df.head(2).to_json(orient="records")),
+    }
 
 
 @app.post("/score")
