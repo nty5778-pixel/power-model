@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v12: MIS CSV/XML 문서 구분 — 백필 실패 근본원인 수정)
+(v13: actuals 중복/구멍 수정 — RT 완결시간만, 시간 단위 스킵)
 
 POST /score
   body: {
@@ -9,7 +9,8 @@ POST /score
     "weather":      {"time":[...], "temperature_2m":[...]},   # Open-Meteo forecast(past_days 포함)
     "weather_prev": {"time":[...], "temperature_2m_previous_day1":[...]},  # 선택: 과거일 D-1 예보
     "have_pred_days":   ["2026-07-30", ...],   # 선택: predictions 탭에 이미 있는 날짜
-    "have_actual_days": ["2026-07-29", ...],   # 선택: actuals 탭에 이미 있는 날짜
+    "have_actual_days": ["2026-07-29", ...],   # (구) 일 단위 — 사용 비권장
+    "have_actual_hours": ["2026-07-29 00:00:00", ...],  # 권장: actuals에 이미 있는 정확한 시각
     "max_backfill_days": 7                     # 선택 (기본 7, MIS 보관한도)
   }
 returns: {predictions:[...], model_detail:[...], new_state:[...], settlements:[...], meta:{...}}
@@ -55,6 +56,7 @@ class ScoreReq(BaseModel):
     weather_prev: dict | None = None
     have_pred_days: list | None = None
     have_actual_days: list | None = None
+    have_actual_hours: list | None = None
     max_backfill_days: int = 7
 
 
@@ -271,55 +273,71 @@ def fetch_eia_actuals(days_back=10):
     return piv[~piv.index.duplicated(keep="last")]
 
 
-def fetch_settlements(cache, skip_days, max_docs=6):
-    """최근 확정일들의 LZ_HOUSTON DA/RT. skip_days(이미 시트에 있는 날짜)는 제외."""
+def _recent_csv_docs(rid, cache, n):
+    """CSV 문서만, 발행일 내림차순으로 최근 n개."""
+    docs = [d for d in mis_doc_list(rid, cache) if doc_fmt(d) != "xml"]
+    return sorted(docs, key=lambda d: str(d.get("PublishDate", "")), reverse=True)[:n]
+
+
+def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=20, min_intervals=4):
+    """최근 확정일들의 LZ_HOUSTON DA/RT.
+    - CSV 문서만 사용(기존엔 XML이 섞여 조용히 버려짐)
+    - RT는 15분 4구간이 모두 모인 '완결된 시간'만 채택 (미완결 시간의 평균은 나중에 값이 바뀜)
+    - skip_hours(이미 시트에 있는 정확한 dt_local)만 제외 — 일 단위로 통째 스킵하지 않음
+    """
     def parse_dam(df):
-        pc = "SettlementPoint" if "SettlementPoint" in df.columns else "Settlement Point"
-        df = df[df[pc] == "LZ_HOUSTON"]
-        vc = "SettlementPointPrice" if "SettlementPointPrice" in df.columns else "Settlement Point Price"
-        dc = "DeliveryDate" if "DeliveryDate" in df.columns else "Delivery Date"
-        hc = "HourEnding" if "HourEnding" in df.columns else "Hour Ending"
-        he = df[hc].astype(str).str.split(":").str[0].astype(int)
-        return pd.Series(pd.to_numeric(df[vc], errors="coerce").values,
-                         index=pd.to_datetime(df[dc]) + pd.to_timedelta(he - 1, unit="h"))
+        pc = _c(df, "SettlementPoint", "Settlement Point", "SettlementPointName")
+        vc = _c(df, "SettlementPointPrice", "Settlement Point Price")
+        dc = _c(df, "DeliveryDate", "Delivery Date")
+        hc = _c(df, "HourEnding", "Hour Ending")
+        df = df[df[pc].astype(str).str.strip() == "LZ_HOUSTON"]
+        idx = _parse_dates(df[dc]) + pd.to_timedelta(_hours(df[hc]).values, unit="h")
+        return pd.Series(pd.to_numeric(df[vc], errors="coerce").values, index=idx).dropna()
 
     def parse_rtm(df):
-        pcol = [c for c in df.columns if c.replace(" ", "") in ("SettlementPointName", "SettlementPoint")]
-        if pcol:
-            df = df[df[pcol[0]] == "LZ_HOUSTON"]
-        dc = "DeliveryDate" if "DeliveryDate" in df.columns else "Delivery Date"
-        hc = [c for c in df.columns if c.replace(" ", "") == "DeliveryHour"][0]
-        vc = [c for c in df.columns if "Price" in c][0]
-        idx = pd.to_datetime(df[dc]) + pd.to_timedelta(df[hc].astype(int) - 1, unit="h")
-        return pd.Series(pd.to_numeric(df[vc], errors="coerce").values, index=idx).groupby(level=0).mean()
+        pc = _c(df, "SettlementPointName", "SettlementPoint", "Settlement Point Name")
+        if pc:
+            df = df[df[pc].astype(str).str.strip() == "LZ_HOUSTON"]
+        dc = _c(df, "DeliveryDate", "Delivery Date")
+        hc = _c(df, "DeliveryHour", "Delivery Hour")
+        vc = _c(df, "SettlementPointPrice", "Settlement Point Price") or \
+             [c for c in df.columns if "Price" in c][0]
+        idx = _parse_dates(df[dc]) + pd.to_timedelta(_hours(df[hc]).values, unit="h")
+        v = pd.to_numeric(df[vc], errors="coerce")
+        g = pd.DataFrame({"rt": v.values}, index=idx).dropna().groupby(level=0)["rt"]
+        return pd.DataFrame({"rt": g.mean(), "n": g.size()})
 
     das, rts = [], []
-    try:
-        for d in mis_doc_list(RID["dam_spp_daily"], cache)[:max_docs]:
+    for rid, fn, sink in ((RID["dam_spp_daily"], parse_dam, das),
+                          (RID["rtm_spp_daily"], parse_rtm, rts)):
+        try:
+            docs = _recent_csv_docs(rid, cache, max_docs)
+        except Exception:
+            continue
+        for d in docs:
             try:
-                das.append(parse_dam(mis_read_csv(d["DocID"])))
+                sink.append(fn(mis_read_csv(d["DocID"])))
             except Exception:
                 pass
-    except Exception:
-        pass
-    try:
-        for d in mis_doc_list(RID["rtm_spp_daily"], cache)[:max_docs]:
-            try:
-                rts.append(parse_rtm(mis_read_csv(d["DocID"])))
-            except Exception:
-                pass
-    except Exception:
-        pass
     if not das or not rts:
         return []
-    da = dedup(pd.concat(das))
-    rt = dedup(pd.concat(rts))
+
+    da = pd.concat(das)
+    da = da[~da.index.duplicated(keep="last")].sort_index()
+
+    rt_all = pd.concat(rts).sort_values("n")
+    rt_all = rt_all[~rt_all.index.duplicated(keep="last")].sort_index()   # 가장 완결된 판본 채택
+    rt = rt_all[rt_all["n"] >= min_intervals]["rt"]
+
     both = pd.concat([da.rename("da"), rt.rename("rt")], axis=1).dropna()
     out = []
     for t, row in both.iterrows():
-        if str(t)[:10] in skip_days:
+        ts = str(t)
+        if ts in skip_hours:
             continue
-        out.append({"dt_local": str(t), "da_spp": round(float(row["da"]), 2),
+        if skip_days and ts[:10] in skip_days:
+            continue
+        out.append({"dt_local": ts, "da_spp": round(float(row["da"]), 2),
                     "rt_spp": round(float(row["rt"]), 2),
                     "dart": round(float(row["da"] - row["rt"]), 2)})
     return out
@@ -586,7 +604,10 @@ def _score(req: ScoreReq):
     state_days = set(d for d, n in day_counts.items() if n >= 20)
 
     have_pred = set(str(x)[:10] for x in (req.have_pred_days or []))
-    have_act = set(str(x)[:10] for x in (req.have_actual_days or []))
+    have_act_h = set(str(x) for x in (req.have_actual_hours or []))
+    # 시간 목록이 오면 그것만 사용(일 단위 스킵은 구멍을 영구화하므로 미사용)
+    have_act_d = set() if req.have_actual_hours is not None else \
+                 set(str(x)[:10] for x in (req.have_actual_days or []))
 
     # ---- 날씨 시리즈 ----
     if not (req.weather and req.weather.get("time")):
@@ -676,7 +697,7 @@ def _score(req: ScoreReq):
         except Exception as e:
             skipped.append({"day": day.isoformat(), "reason": f"{type(e).__name__}: {e}"})
 
-    settlements = fetch_settlements(cache, have_act)
+    settlements = fetch_settlements(cache, have_act_h, have_act_d)
 
     return {
         "predictions": preds_out,
