@@ -269,3 +269,77 @@ GET https://power-model.onrender.com/health
 ```
 `version`이 기대값과 다르면 Render가 아직 이전 커밋을 돌리고 있는 것 —
 Render 대시보드에서 Manual Deploy → Deploy latest commit.
+
+## 16. actuals가 여전히 안 채워질 때 — /settle (v14)
+
+`fetch_settlements`는 실패를 전부 `except: pass`로 삼켜서 왜 비었는지 알 수 없었다. v14에서 진단을 노출.
+
+```
+https://power-model.onrender.com/settle
+```
+시트 상태와 무관하게 MIS만 조회해서, 정산값이 만들어지는 **전 과정을 단계별로** 보여준다.
+
+`diag.notes`를 위에서부터 읽으면 어디서 끊겼는지 나온다:
+```
+dam:CSV문서 12개
+rtm:CSV문서 12개
+DAM시간 288 / RT시간 288 (구간수분포 {2:2, 4:286}) → 완결(n>=4) 286
+DA∩RT 교집합 286시간
+범위 2026-07-21 00:00:00~2026-08-01 21:00:00
+시트에 이미 있어 스킵 0 → 신규 286행
+```
+
+단계별 진단
+| 어디서 0이 되나 | 원인 |
+|---|---|
+| `CSV문서 0개` | 문서 목록에 CSV가 없음 — 리포트 ID(12331/12301) 확인 필요 |
+| `diag.dam[]`에 `실패(...)` 만 있음 | 파싱 실패. 괄호 안 예외 메시지가 원인 (컬럼명 변경 등) |
+| `완결(n>=4) 0` | RT 구간수 분포 확인. `{1: ...}`이면 그 리포트가 이미 시간단위 → `?min_intervals=1` |
+| `DA∩RT 교집합 0` | DAM/RTM의 시각 정렬이 어긋남 (HourEnding 해석 문제) |
+| `신규 0행` | 값은 다 있는데 전부 시트에 이미 존재 — 정상 |
+
+`/score` 응답의 `meta.settlement_diag`에도 같은 내용이 들어가므로, 워크플로 실행 후 runlog로도 추적 가능.
+
+파라미터: `/settle?max_docs=40` (더 과거까지), `/settle?min_intervals=1` (완결 필터 해제)
+
+## 17. 시트 실측 점검 결과 (2026-08-02) 및 워크플로 v12
+
+Google Drive로 시트를 직접 읽어 확인한 것들.
+
+### 확인된 정상
+- `state` — runlog 기준 2026-07-06~08-03 (07-26 제외) 보유. **백필 성공**
+- `runlog` — 01:02:56 실행에서 8일 전부 `mis+state`로 처리, skipped 없음
+- `predictions` / `model_detail` — 내용 정상
+
+### 발견된 문제 3가지 → v12에서 수정
+
+**(1) predictions 중복 append.**
+`2026-08-01`이 120행(=24×5), `2026-07-25`가 48행(=24×2). 중복 타임스탬프 48개.
+원인: `/score`는 내일치를 **항상** 다시 내보낸다(`need_pred or day == tomorrow`).
+하루에 워크플로를 5번 수동 실행하면 같은 날 판정이 5벌 쌓인다.
+→ v12: `Build appends`가 `predictions!A:A` / `model_detail!A:A`의 기존 dt_local과 대조해
+**이미 있는 시각은 제외**. 몇 번을 재실행해도 중복이 생기지 않는다.
+
+**(2) daily_summary가 안 채워짐 — v9에서 내가 넣은 회귀.**
+시트 헤더는 `run_date, target_day, n_buy_da, n_neutral, n_buy_rt, max_p_spike,
+model_3class_summary, spike_model_summary, final_recommendation` 9개인데,
+v9 `Build appends`는 `run_at, n_da, n_rt, claude_summary` 등 다른 키를 내보냈다.
+헤더 기준 매핑이라 **거의 전 컬럼이 빈칸**이 된다.
+→ v12: 시트의 기존 9컬럼 스키마 그대로 출력. Claude 노드도 JSON 3부 구조
+(`model_3class_summary` / `spike_model_summary` / `final_recommendation`)로 응답하도록 복구.
+코드펜스가 붙어 와도 벗겨내고, 파싱 실패 시 원문을 첫 칸에 넣는 폴백 포함.
+
+**(3) runlog 컬럼 부족.**
+정산 진단(v14의 `settlement_diag`)을 담을 자리가 없었다.
+→ runlog 헤더 끝에 **`n_settlements`, `settlement_notes` 2개 추가 필요**:
+```
+run_at  target_day  todo_days  processed  skipped  backfilled  state_rows_returned
+state_days_in_sheet  model_detail_rows  n_settlements  settlement_notes
+```
+이제 매 실행마다 정산이 몇 행 나왔는지, 안 나왔으면 왜인지가 runlog에 남는다.
+(`processed`/`skipped` 구분자도 `|` → `;` 로 변경 — `|`는 CSV/마크다운 내보내기에서 열이 밀린다)
+
+### 기존 중복 정리
+`predictions` 탭에서 `dt_local` 기준 중복 제거(가장 최근 `generated_at`만 남김) 후 v12 사용.
+데이터 → 데이터 정리 → 중복 항목 삭제 에서 `dt_local` 열만 선택하면 되지만,
+그러면 **먼저 나온 행**이 남으므로 `generated_at` 내림차순 정렬 후 실행할 것.

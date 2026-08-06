@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v13: actuals 중복/구멍 수정 — RT 완결시간만, 시간 단위 스킵)
+(v16: EIA 상태·피처 결측률 노출 — 조용한 품질 저하 방지)
 
 POST /score
   body: {
@@ -47,7 +47,7 @@ RID = {"load_fcst": 12312, "wind": 13028, "solar": 13483, "outage": 13103,
 STATE_COLS = ["lf_sys", "stwpf", "wgrpp", "stppf", "temp_fcst",
               "outage_total", "outage_houston", "outage_irr"]
 
-VERSION = "v13"
+VERSION = "v16"
 app = FastAPI()
 
 
@@ -126,6 +126,17 @@ def _parse_dates(s):
         if d.notna().any():
             return d.dt.normalize()
     return pd.Series(pd.NaT, index=s.index)
+
+
+def _norm_ts(x):
+    """'2026-08-01 0:00:00' / ISO / 엑셀시리얼 등을 'YYYY-MM-DD HH:MM:SS'로 정규화."""
+    try:
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            return str((pd.Timestamp("1899-12-30") + pd.to_timedelta(float(x), unit="D")).round("s"))
+        t = pd.to_datetime(str(x), errors="coerce")
+        return str(t) if pd.notna(t) else str(x).strip()
+    except Exception:
+        return str(x).strip()
 
 
 def _hours(s):
@@ -308,40 +319,55 @@ def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=20, min_interval
         g = pd.DataFrame({"rt": v.values}, index=idx).dropna().groupby(level=0)["rt"]
         return pd.DataFrame({"rt": g.mean(), "n": g.size()})
 
+    diag = {"dam": [], "rtm": [], "notes": []}
     das, rts = [], []
-    for rid, fn, sink in ((RID["dam_spp_daily"], parse_dam, das),
-                          (RID["rtm_spp_daily"], parse_rtm, rts)):
+    for tag, rid, fn, sink in (("dam", RID["dam_spp_daily"], parse_dam, das),
+                               ("rtm", RID["rtm_spp_daily"], parse_rtm, rts)):
         try:
             docs = _recent_csv_docs(rid, cache, max_docs)
-        except Exception:
+        except Exception as e:
+            diag["notes"].append(f"{tag}:목록실패 {type(e).__name__}:{e}")
             continue
+        diag["notes"].append(f"{tag}:CSV문서 {len(docs)}개")
         for d in docs:
+            pub = str(d.get("PublishDate", ""))[:16]
             try:
-                sink.append(fn(mis_read_csv(d["DocID"])))
-            except Exception:
-                pass
+                r = fn(mis_read_csv(d["DocID"]))
+                sink.append(r)
+                diag[tag].append(f"{pub}:행{len(r)}")
+            except Exception as e:
+                diag[tag].append(f"{pub}:실패({type(e).__name__}:{str(e)[:60]})")
+
     if not das or not rts:
-        return []
+        diag["notes"].append("DAM 또는 RTM 파싱 결과 없음 → settlements 비움")
+        return [], diag
 
     da = pd.concat(das)
     da = da[~da.index.duplicated(keep="last")].sort_index()
 
     rt_all = pd.concat(rts).sort_values("n")
-    rt_all = rt_all[~rt_all.index.duplicated(keep="last")].sort_index()   # 가장 완결된 판본 채택
+    rt_all = rt_all[~rt_all.index.duplicated(keep="last")].sort_index()
+    n_hist = rt_all["n"].value_counts().sort_index().to_dict()
     rt = rt_all[rt_all["n"] >= min_intervals]["rt"]
+    diag["notes"].append(f"DAM시간 {len(da)} / RT시간 {len(rt_all)} "
+                         f"(구간수분포 {n_hist}) → 완결(n>={min_intervals}) {len(rt)}")
 
     both = pd.concat([da.rename("da"), rt.rename("rt")], axis=1).dropna()
-    out = []
+    diag["notes"].append(f"DA∩RT 교집합 {len(both)}시간")
+    if len(both):
+        diag["notes"].append(f"범위 {str(both.index.min())}~{str(both.index.max())}")
+
+    out, skipped_n = [], 0
     for t, row in both.iterrows():
         ts = str(t)
-        if ts in skip_hours:
-            continue
-        if skip_days and ts[:10] in skip_days:
+        if ts in skip_hours or (skip_days and ts[:10] in skip_days):
+            skipped_n += 1
             continue
         out.append({"dt_local": ts, "da_spp": round(float(row["da"]), 2),
                     "rt_spp": round(float(row["rt"]), 2),
                     "dart": round(float(row["da"] - row["rt"]), 2)})
-    return out
+    diag["notes"].append(f"시트에 이미 있어 스킵 {skipped_n} → 신규 {len(out)}행")
+    return out, diag
 
 
 # ---------------- feature builder ----------------
@@ -470,7 +496,10 @@ def _r(s, t):
 @app.get("/health")
 def health():
     return {"ok": True, "version": VERSION, "trained_through": CFG["trained_through"],
-            "endpoints": ["/health", "/probe?days=7", "/peek?product=&pub=", "POST /score"]}
+            "eia_key_set": bool(os.environ.get("EIA_API_KEY")),
+            "n_models": len(M3) + len(MS),
+            "endpoints": ["/health", "/probe?days=7", "/peek?product=&pub=",
+                          "/settle", "POST /score"]}
 
 
 @app.get("/probe")
@@ -570,6 +599,16 @@ def peek(product: str = "load_fcst", pub: str = ""):
     }
 
 
+@app.get("/settle")
+def settle(max_docs: int = 20, min_intervals: int = 4):
+    """actuals가 안 채워질 때 원인을 보여준다. 시트 상태와 무관하게 MIS만 조회."""
+    rows, diag = fetch_settlements({}, set(), (), max_docs=max_docs, min_intervals=min_intervals)
+    return {"n_rows": len(rows), "diag": diag,
+            "first": rows[:3], "last": rows[-3:],
+            "hint": ("정상 — 워크플로가 이 행들을 actuals에 append해야 함" if rows else
+                     "diag.notes 를 위에서부터 읽으면 어느 단계에서 끊겼는지 보임")}
+
+
 @app.post("/score")
 def score(req: ScoreReq):
     import traceback
@@ -605,8 +644,8 @@ def _score(req: ScoreReq):
     day_counts = hist["lf_sys"].dropna().groupby(hist["lf_sys"].dropna().index.date).size()
     state_days = set(d for d, n in day_counts.items() if n >= 20)
 
-    have_pred = set(str(x)[:10] for x in (req.have_pred_days or []))
-    have_act_h = set(str(x) for x in (req.have_actual_hours or []))
+    have_pred = set(_norm_ts(x)[:10] for x in (req.have_pred_days or []))
+    have_act_h = set(_norm_ts(x) for x in (req.have_actual_hours or []))
     # 시간 목록이 오면 그것만 사용(일 단위 스킵은 구멍을 영구화하므로 미사용)
     have_act_d = set() if req.have_actual_hours is not None else \
                  set(str(x)[:10] for x in (req.have_actual_days or []))
@@ -640,7 +679,12 @@ def _score(req: ScoreReq):
     todo = sorted(set(todo))
 
     eia = fetch_eia_actuals()
+    eia_stat = {"ok": eia is not None,
+                "key_set": bool(os.environ.get("EIA_API_KEY")),
+                "rows": (0 if eia is None else int(len(eia))),
+                "last": (None if eia is None or not len(eia) else str(eia.index.max()))}
     cache = {}
+    feat_health = {}
     preds_out, state_out, detail_out, processed, skipped = [], [], [], [], []
 
     for day in todo:
@@ -667,6 +711,12 @@ def _score(req: ScoreReq):
             inp["temp_fcst"] = tfs
 
             f = build_features(day, inp, hist, eia, temps_now, tfs)
+            if day == tomorrow:
+                need = sorted(set(CFG["features_3class"]) | set(CFG["features_spike"]))
+                bad = {c: round(float(f[c].isna().mean()), 2) for c in need
+                       if c in f.columns and f[c].isna().mean() > 0.5}
+                miss = [c for c in need if c not in f.columns]
+                feat_health = {"n_features": len(need), "high_nan": bad, "missing": miss}
             p3, ps, ED, dec, detail = predict_day(f)
 
             need_pred = (day.isoformat() not in have_pred) if req.have_pred_days is not None else True
@@ -699,7 +749,7 @@ def _score(req: ScoreReq):
         except Exception as e:
             skipped.append({"day": day.isoformat(), "reason": f"{type(e).__name__}: {e}"})
 
-    settlements = fetch_settlements(cache, have_act_h, have_act_d)
+    settlements, settle_diag = fetch_settlements(cache, have_act_h, have_act_d)
 
     return {
         "predictions": preds_out,
@@ -716,6 +766,10 @@ def _score(req: ScoreReq):
             "todo_days": [str(d) for d in todo],
             "n_state_rows_returned": len(state_out),
             "n_model_detail_rows": len(detail_out),
+            "n_settlements": len(settlements),
+            "eia": eia_stat,
+            "feature_health": feat_health,
+            "settlement_diag": settle_diag,
             "config": {k: CFG[k] for k in ("band", "spike_threshold", "trained_through")},
         },
     }

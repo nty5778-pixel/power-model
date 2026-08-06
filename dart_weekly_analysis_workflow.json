@@ -1,63 +1,61 @@
 {
-  "name": "ERCOT DART Weekly Analysis (Claude)",
+  "name": "ERCOT DART Weekly Analysis (v2: batchGet 1회)",
   "nodes": [
     {
       "parameters": {
-        "rule": { "interval": [ { "field": "cronExpression", "expression": "0 9 * * 1" } ] }
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
       },
       "id": "sched",
       "name": "Schedule Mon 09:00 CT",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [0, 0]
+      "position": [
+        0,
+        0
+      ]
     },
     {
       "parameters": {
-        "operation": "read",
-        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
-        "sheetName": { "__rl": true, "value": "predictions", "mode": "name" },
-        "options": {}
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4/values:batchGet?ranges=predictions!A:H&ranges=actuals!A:D&ranges=analysis!1:1&majorDimension=ROWS&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {
+          "timeout": 120000
+        }
       },
-      "id": "read_preds",
-      "name": "Read predictions",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [200, -80]
+      "id": "read",
+      "name": "Read sheets (1 call)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000
     },
     {
       "parameters": {
-        "operation": "read",
-        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
-        "sheetName": { "__rl": true, "value": "actuals", "mode": "name" },
-        "options": {}
-      },
-      "id": "read_actuals",
-      "name": "Read actuals",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [200, 80]
-    },
-    {
-      "parameters": {
-        "mode": "combine",
-        "combineBy": "combineAll",
-        "options": {}
-      },
-      "id": "merge",
-      "name": "Merge",
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 3,
-      "position": [400, 0]
-    },
-    {
-      "parameters": {
-        "jsCode": "// predictions와 actuals를 dt_local로 조인하고 지표를 결정적으로 계산\nconst preds = $('Read predictions').all().map(i => i.json);\nconst acts = $('Read actuals').all().map(i => i.json);\nconst actMap = new Map(acts.map(a => [String(a.dt_local), a]));\nconst now = new Date();\nconst wk = 7 * 24 * 3600 * 1000;\n\nfunction metrics(rows) {\n  let n = 0, hit = 0, sHalf = 0, sRT = 0, sDA = 0;\n  const byClass = { BUY_DA: { n: 0, hit: 0 }, NEUTRAL_5050: { n: 0, hit: 0 }, BUY_RT: { n: 0, hit: 0 } };\n  let worst = null;\n  for (const p of rows) {\n    const a = actMap.get(String(p.dt_local));\n    if (!a || a.dart === undefined || a.dart === '') continue;\n    const dart = Number(a.dart), da = Number(a.da_spp), rt = Number(a.rt_spp);\n    const half = (da + rt) / 2;\n    let cost, ok;\n    if (p.decision === 'BUY_DA') { cost = da; ok = dart < 0; }\n    else if (p.decision === 'BUY_RT') { cost = rt; ok = dart > 0; }\n    else { cost = half; ok = Math.abs(dart) <= 1; }\n    n++; if (ok) hit++;\n    sHalf += half - cost; sRT += rt - cost; sDA += da - cost;\n    const c = byClass[p.decision] || (byClass[p.decision] = { n: 0, hit: 0 });\n    c.n++; if (ok) c.hit++;\n    const loss = cost - Math.min(da, rt);\n    if (!worst || loss > worst.loss) worst = { dt: p.dt_local, decision: p.decision, dart: dart, loss: Math.round(loss * 100) / 100 };\n  }\n  return { n, hit_rate: n ? +(hit / n).toFixed(3) : null,\n    save_vs_half: n ? +(sHalf / n).toFixed(3) : null,\n    save_vs_rt: n ? +(sRT / n).toFixed(3) : null,\n    save_vs_da: n ? +(sDA / n).toFixed(3) : null,\n    by_class: Object.fromEntries(Object.entries(byClass).map(([k, v]) => [k, { n: v.n, hit: v.n ? +(v.hit / v.n).toFixed(3) : null }])),\n    worst_hour: worst };\n}\n\nconst last7 = preds.filter(p => (now - new Date(p.dt_local)) < wk && (now - new Date(p.dt_local)) > 0);\nconst m7 = metrics(last7);\nconst mAll = metrics(preds);\nreturn [{ json: { week_ending: now.toISOString().slice(0, 10), last7: m7, cumulative: mAll } }];"
+        "jsCode": "\nfunction norm(v){ if(v===null||v===undefined||v==='')return '';\n  if(typeof v==='number'){const ms=Math.round((v-25569)*86400000);\n    return new Date(ms).toISOString().slice(0,19).replace('T',' ');}\n  const s=String(v).trim().replace('T',' ');\n  const m=s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})[ ]?(\\d{1,2})?:?(\\d{1,2})?:?(\\d{1,2})?/);\n  if(!m)return s; const p=(x,n)=>String(x||0).padStart(n,'0');\n  return `${m[1]}-${p(m[2],2)}-${p(m[3],2)} ${p(m[4],2)}:${p(m[5],2)}:${p(m[6],2)}`; }\nfunction objs(vals){ if(!vals||!vals.length)return [];\n  const h=vals[0].map(x=>String(x).trim());\n  return vals.slice(1).map(r=>{const o={};h.forEach((k,j)=>o[k]=r[j]);return o;}); }\n\nconst vr=$input.first().json.valueRanges||[];\nconst preds=objs((vr[0]||{}).values).filter(p=>p.dt_local&&p.decision);\nconst acts =objs((vr[1]||{}).values).filter(a=>a.dt_local);\nconst actMap=new Map(acts.map(a=>[norm(a.dt_local),a]));\n\n// 최신 실적 시각 기준 7일 (실행 시각이 아니라 데이터 기준 — 결정적)\nconst times=acts.map(a=>norm(a.dt_local)).filter(Boolean).sort();\nconst last = times.length? new Date(times[times.length-1].replace(' ','T')) : null;\nconst wkAgo = last? new Date(last.getTime()-7*24*3600*1000) : null;\n\nfunction metrics(rows){\n  let n=0,hit=0,sHalf=0,sRT=0,sDA=0,worst=null;\n  const byClass={};\n  for(const p of rows){\n    const a=actMap.get(norm(p.dt_local)); if(!a||a.dart===''||a.dart===undefined) continue;\n    const dart=Number(a.dart), da=Number(a.da_spp), rt=Number(a.rt_spp);\n    if(!isFinite(dart)||!isFinite(da)||!isFinite(rt)) continue;\n    const half=(da+rt)/2; let cost,ok;\n    if(p.decision==='BUY_DA'){cost=da;ok=dart<0;}\n    else if(p.decision==='BUY_RT'){cost=rt;ok=dart>0;}\n    else {cost=half;ok=Math.abs(dart)<=1;}\n    n++; if(ok)hit++;\n    sHalf+=half-cost; sRT+=rt-cost; sDA+=da-cost;\n    const c=byClass[p.decision]||(byClass[p.decision]={n:0,hit:0}); c.n++; if(ok)c.hit++;\n    const loss=cost-Math.min(da,rt);\n    if(!worst||loss>worst.loss) worst={dt:p.dt_local,decision:p.decision,dart:+dart.toFixed(2),loss:+loss.toFixed(2)};\n  }\n  const r=x=>n?+(x/n).toFixed(3):null;\n  return {n,hit_rate:r(hit),save_vs_half:r(sHalf),save_vs_rt:r(sRT),save_vs_da:r(sDA),\n    by_class:Object.fromEntries(Object.entries(byClass).map(([k,v])=>[k,{n:v.n,hit:+(v.hit/v.n).toFixed(3)}])),\n    worst_hour:worst};\n}\nconst last7 = wkAgo? preds.filter(p=>{const t=new Date(norm(p.dt_local).replace(' ','T'));return t>wkAgo&&t<=last;}) : [];\nreturn [{json:{ week_ending: last? norm(last.toISOString()).slice(0,10) : '',\n  n_pred: preds.length, n_act: acts.length,\n  last7: metrics(last7), cumulative: metrics(preds),\n  analysis_header: (((vr[2]||{}).values)||[[]])[0]||[] }}];\n"
       },
       "id": "calc",
       "name": "Compute metrics",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [600, 0]
+      "position": [
+        440,
+        0
+      ],
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -68,58 +66,135 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "anthropic-version", "value": "2023-06-01" },
-            { "name": "content-type", "value": "application/json" }
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1200, messages: [{ role: 'user', content: 'ERCOT LZ_HOUSTON DA/RT 조달 모델의 주간 성과 데이터입니다. 이 모델은 매일 아침 내일 24시간에 대해 BUY_DA/NEUTRAL_5050/BUY_RT를 판정합니다. 벤치마크: 항상RT 구매가 나이브 최강 전략이며, 모델의 기대 성능은 vs항상RT +$0.3~0.4/MWh입니다. 적중 규칙: BUY_DA는 DART<0, BUY_RT는 DART>0, NEUTRAL은 |DART|<=1이면 적중.\\n\\n데이터(JSON): ' + JSON.stringify($json) + '\\n\\n다음을 한국어로 간결히 작성하세요 (400자 이내, 마크다운 없이): 1) 이번 주 성과 한줄 평가 (기대치 대비) 2) 클래스별 판정 품질에서 눈에 띄는 점 3) 이상 징후 여부 (vs항상RT 음수 지속, DA콜 적중 급락 등 레짐 변화 신호) 4) 권장 액션 (없으면 \\'유지\\'). 숫자는 데이터에 있는 것만 인용하세요.' }] }) }}",
-        "options": { "timeout": 120000 }
+        "jsonBody": "={{ JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:1200, messages:[{role:'user',content:'ERCOT LZ_HOUSTON DA/RT 조달 모델의 주간 성과입니다. 매일 아침 내일 24시간에 대해 BUY_DA/NEUTRAL_5050/BUY_RT를 판정합니다.\\n벤치마크: 항상RT 구매가 나이브 최강 전략이며 기대 성능은 vs항상RT +$0.3~0.4/MWh입니다.\\n적중: BUY_DA는 DART<0, BUY_RT는 DART>0, NEUTRAL은 |DART|<=1.\\n주의: 적중률과 절감은 갈릴 수 있으며 판단 기준은 save_vs_rt 입니다.\\n\\n데이터: ' + JSON.stringify($json) + '\\n\\n한국어로 400자 이내, 마크다운 없이: 1) 이번 주 성과 한줄 평가(기대치 대비) 2) 클래스별 판정 품질 3) 이상 징후(vs항상RT 음수 지속, DA콜 적중 급락 등) 4) 권장 액션(없으면 유지). 숫자는 데이터에 있는 것만 인용.' }] }) }}",
+        "options": {
+          "timeout": 120000
+        }
       },
       "id": "claude",
-      "name": "Claude API 분석",
+      "name": "Claude 주간 분석",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [800, 0],
+      "position": [
+        660,
+        0
+      ],
+      "executeOnce": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
       "notes": "크리덴셜: Header Auth (name: x-api-key, value: Anthropic API 키)"
     },
     {
       "parameters": {
-        "jsCode": "const m = $('Compute metrics').first().json;\nconst resp = $input.first().json;\nconst text = (resp.content && resp.content[0] && resp.content[0].text) ? resp.content[0].text : JSON.stringify(resp).slice(0, 500);\nreturn [{ json: {\n  week_ending: m.week_ending,\n  n_hours_7d: m.last7.n,\n  hit_7d: m.last7.hit_rate,\n  save_vs_half_7d: m.last7.save_vs_half,\n  save_vs_rt_7d: m.last7.save_vs_rt,\n  hit_cum: m.cumulative.hit_rate,\n  save_vs_rt_cum: m.cumulative.save_vs_rt,\n  worst_hour_7d: m.last7.worst_hour ? `${m.last7.worst_hour.dt} ${m.last7.worst_hour.decision} loss$${m.last7.worst_hour.loss}` : '',\n  claude_analysis: text\n} }];"
+        "jsCode": "\nconst m=$('Compute metrics').first().json;\nconst resp=$input.first().json;\nconst text=(resp.content&&resp.content[0]&&resp.content[0].text)?resp.content[0].text:JSON.stringify(resp).slice(0,500);\nconst row={ week_ending:m.week_ending, n_hours_7d:m.last7.n, hit_7d:m.last7.hit_rate,\n  save_vs_half_7d:m.last7.save_vs_half, save_vs_rt_7d:m.last7.save_vs_rt,\n  hit_cum:m.cumulative.hit_rate, save_vs_rt_cum:m.cumulative.save_vs_rt,\n  worst_hour_7d:m.last7.worst_hour?`${m.last7.worst_hour.dt} ${m.last7.worst_hour.decision} loss$${m.last7.worst_hour.loss}`:'',\n  claude_analysis:text };\nconst hdr=m.analysis_header.length?m.analysis_header:Object.keys(row);\nconst values=[hdr.map(h=>{const v=row[String(h).trim()];return (v===undefined||v===null)?'':v;})];\nreturn [{json:{tab:'analysis',values,n:1}}];\n"
       },
       "id": "pack",
       "name": "Pack analysis row",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1000, 0]
+      "position": [
+        880,
+        0
+      ],
+      "executeOnce": true
     },
     {
       "parameters": {
-        "operation": "append",
-        "documentId": { "__rl": true, "value": "1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4", "mode": "id" },
-        "sheetName": { "__rl": true, "value": "analysis", "mode": "name" },
-        "columns": { "mappingMode": "autoMapInputData" },
-        "options": {}
+        "method": "POST",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/1_8iT4KB0SG6gra56E2PyLvkr6rsjBJ_w6GkSUOeWUU4/values/' + encodeURIComponent($json.tab + '!A1') + ':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: $json.values }) }}",
+        "options": {
+          "timeout": 120000
+        }
       },
-      "id": "append_analysis",
+      "id": "append",
       "name": "Append analysis",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
-      "position": [1200, 0]
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     }
   ],
   "connections": {
-    "Schedule Mon 09:00 CT": { "main": [[
-      { "node": "Read predictions", "type": "main", "index": 0 },
-      { "node": "Read actuals", "type": "main", "index": 0 }
-    ]] },
-    "Read predictions": { "main": [[{ "node": "Merge", "type": "main", "index": 0 }]] },
-    "Read actuals": { "main": [[{ "node": "Merge", "type": "main", "index": 1 }]] },
-    "Merge": { "main": [[{ "node": "Compute metrics", "type": "main", "index": 0 }]] },
-    "Compute metrics": { "main": [[{ "node": "Claude API 분석", "type": "main", "index": 0 }]] },
-    "Claude API 분석": { "main": [[{ "node": "Pack analysis row", "type": "main", "index": 0 }]] },
-    "Pack analysis row": { "main": [[{ "node": "Append analysis", "type": "main", "index": 0 }]] }
+    "Schedule Mon 09:00 CT": {
+      "main": [
+        [
+          {
+            "node": "Read sheets (1 call)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read sheets (1 call)": {
+      "main": [
+        [
+          {
+            "node": "Compute metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute metrics": {
+      "main": [
+        [
+          {
+            "node": "Claude 주간 분석",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude 주간 분석": {
+      "main": [
+        [
+          {
+            "node": "Pack analysis row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pack analysis row": {
+      "main": [
+        [
+          {
+            "node": "Append analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
-  "settings": { "timezone": "America/Chicago" }
+  "settings": {
+    "timezone": "America/Chicago"
+  }
 }
