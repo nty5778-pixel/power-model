@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v16: EIA 상태·피처 결측률 노출 — 조용한 품질 저하 방지)
+(v17: RTM 15분 구간 집계 수정 — actuals가 항상 비던 원인)
 
 POST /score
   body: {
@@ -47,7 +47,7 @@ RID = {"load_fcst": 12312, "wind": 13028, "solar": 13483, "outage": 13103,
 STATE_COLS = ["lf_sys", "stwpf", "wgrpp", "stppf", "temp_fcst",
               "outage_total", "outage_houston", "outage_irr"]
 
-VERSION = "v16"
+VERSION = "v17"
 app = FastAPI()
 
 
@@ -291,11 +291,14 @@ def _recent_csv_docs(rid, cache, n):
     return sorted(docs, key=lambda d: str(d.get("PublishDate", "")), reverse=True)[:n]
 
 
-def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=20, min_intervals=4):
-    """최근 확정일들의 LZ_HOUSTON DA/RT.
-    - CSV 문서만 사용(기존엔 XML이 섞여 조용히 버려짐)
-    - RT는 15분 4구간이 모두 모인 '완결된 시간'만 채택 (미완결 시간의 평균은 나중에 값이 바뀜)
-    - skip_hours(이미 시트에 있는 정확한 dt_local)만 제외 — 일 단위로 통째 스킵하지 않음
+def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=25,
+                      min_intervals=4, rtm_days=2, max_rtm_docs=220):
+    """LZ_HOUSTON DA/RT 정산값.
+
+    DAM(12331)은 하루 1문서 × 24행이지만, RTM(12301)은 **15분마다 1문서 × 1행**이다.
+    따라서 RTM은 문서를 구간(interval) 단위로 모아 시간별로 4구간을 채워야 한다.
+    (v16까지는 문서별로 시간평균을 낸 뒤 시간 기준 중복제거를 해서 3구간을 버렸고,
+     그 결과 n>=4 조건을 영원히 만족하지 못해 actuals가 항상 비었다.)
     """
     def parse_dam(df):
         pc = _c(df, "SettlementPoint", "Settlement Point", "SettlementPointName")
@@ -306,56 +309,96 @@ def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=20, min_interval
         idx = _parse_dates(df[dc]) + pd.to_timedelta(_hours(df[hc]).values, unit="h")
         return pd.Series(pd.to_numeric(df[vc], errors="coerce").values, index=idx).dropna()
 
-    def parse_rtm(df):
+    def parse_rtm_intervals(df):
+        """구간 단위 원본을 (시각, 구간번호, 가격) 프레임으로 반환."""
         pc = _c(df, "SettlementPointName", "SettlementPoint", "Settlement Point Name")
         if pc:
             df = df[df[pc].astype(str).str.strip() == "LZ_HOUSTON"]
         dc = _c(df, "DeliveryDate", "Delivery Date")
         hc = _c(df, "DeliveryHour", "Delivery Hour")
-        vc = _c(df, "SettlementPointPrice", "Settlement Point Price") or \
-             [c for c in df.columns if "Price" in c][0]
+        ic = _c(df, "DeliveryInterval", "Delivery Interval")
+        vc = _c(df, "SettlementPointPrice", "Settlement Point Price")
+        if vc is None:
+            vc = [c for c in df.columns if "Price" in c][0]
         idx = _parse_dates(df[dc]) + pd.to_timedelta(_hours(df[hc]).values, unit="h")
-        v = pd.to_numeric(df[vc], errors="coerce")
-        g = pd.DataFrame({"rt": v.values}, index=idx).dropna().groupby(level=0)["rt"]
-        return pd.DataFrame({"rt": g.mean(), "n": g.size()})
+        iv = pd.to_numeric(df[ic], errors="coerce") if ic else pd.Series(1, index=df.index)
+        return pd.DataFrame({"ts": idx, "iv": iv.values,
+                             "rt": pd.to_numeric(df[vc], errors="coerce").values}).dropna()
 
     diag = {"dam": [], "rtm": [], "notes": []}
-    das, rts = [], []
-    for tag, rid, fn, sink in (("dam", RID["dam_spp_daily"], parse_dam, das),
-                               ("rtm", RID["rtm_spp_daily"], parse_rtm, rts)):
-        try:
-            docs = _recent_csv_docs(rid, cache, max_docs)
-        except Exception as e:
-            diag["notes"].append(f"{tag}:목록실패 {type(e).__name__}:{e}")
-            continue
-        diag["notes"].append(f"{tag}:CSV문서 {len(docs)}개")
+
+    # ---- DAM (일 단위 문서) ----
+    das = []
+    try:
+        docs = _recent_csv_docs(RID["dam_spp_daily"], cache, max_docs)
+        diag["notes"].append(f"dam:CSV문서 {len(docs)}개")
         for d in docs:
             pub = str(d.get("PublishDate", ""))[:16]
             try:
-                r = fn(mis_read_csv(d["DocID"]))
-                sink.append(r)
-                diag[tag].append(f"{pub}:행{len(r)}")
+                r = parse_dam(mis_read_csv(d["DocID"]))
+                das.append(r); diag["dam"].append(f"{pub}:행{len(r)}")
             except Exception as e:
-                diag[tag].append(f"{pub}:실패({type(e).__name__}:{str(e)[:60]})")
-
-    if not das or not rts:
-        diag["notes"].append("DAM 또는 RTM 파싱 결과 없음 → settlements 비움")
+                diag["dam"].append(f"{pub}:실패({type(e).__name__}:{str(e)[:50]})")
+    except Exception as e:
+        diag["notes"].append(f"dam:목록실패 {type(e).__name__}:{e}")
+    if not das:
+        diag["notes"].append("DAM 없음 → settlements 비움")
         return [], diag
-
     da = pd.concat(das)
     da = da[~da.index.duplicated(keep="last")].sort_index()
 
-    rt_all = pd.concat(rts).sort_values("n")
-    rt_all = rt_all[~rt_all.index.duplicated(keep="last")].sort_index()
+    # ---- RTM (15분 단위 문서) : 필요한 날짜만 골라 받는다 ----
+    try:
+        alldocs = [d for d in mis_doc_list(RID["rtm_spp_daily"], cache) if doc_fmt(d) != "xml"]
+    except Exception as e:
+        diag["notes"].append(f"rtm:목록실패 {type(e).__name__}:{e}")
+        return [], diag
+    alldocs = sorted(alldocs, key=lambda d: str(d.get("PublishDate", "")), reverse=True)
+    pubdays = sorted({str(d.get("PublishDate", ""))[:10] for d in alldocs} - {""}, reverse=True)
+    want = set(pubdays[:max(1, rtm_days) + 1])       # 자정 넘어 발행되는 마지막 구간까지 포함
+    cand = [d for d in alldocs if str(d.get("PublishDate", ""))[:10] in want]
+
+    def _covered(d):
+        """발행시각으로 딜리버리 시간을 추정해, 이미 시트에 있는 시간대면 받지 않는다."""
+        if not skip_hours:
+            return False
+        try:
+            p = pd.to_datetime(str(d.get("PublishDate", "")).replace("T", " "))
+        except Exception:
+            return False
+        h0 = p.floor("h")
+        return str(h0) in skip_hours and str(h0 - pd.Timedelta(hours=1)) in skip_hours
+
+    picked = [d for d in cand if not _covered(d)][:max_rtm_docs]
+    diag["notes"].append(f"rtm:전체문서 {len(alldocs)}개 / 발행일 {len(pubdays)}일 → 대상 {sorted(want)} "
+                         f"후보 {len(cand)}개 중 기수집분 제외하고 {len(picked)}개 수신")
+
+    parts, fails = [], 0
+    for d in picked:
+        try:
+            parts.append(parse_rtm_intervals(mis_read_csv(d["DocID"])))
+        except Exception as e:
+            fails += 1
+            if fails <= 3:
+                diag["rtm"].append(f"{str(d.get('PublishDate',''))[:16]}:실패({type(e).__name__}:{str(e)[:40]})")
+    diag["notes"].append(f"rtm:수신 {len(picked)}개 중 파싱실패 {fails}개")
+    if not parts:
+        diag["notes"].append("RTM 파싱 결과 없음 → settlements 비움")
+        return [], diag
+
+    iv = pd.concat(parts, ignore_index=True)
+    iv = iv.drop_duplicates(subset=["ts", "iv"], keep="last")      # 구간 단위 중복 제거
+    g = iv.groupby("ts")["rt"]
+    rt_all = pd.DataFrame({"rt": g.mean(), "n": g.size()}).sort_index()
     n_hist = rt_all["n"].value_counts().sort_index().to_dict()
     rt = rt_all[rt_all["n"] >= min_intervals]["rt"]
-    diag["notes"].append(f"DAM시간 {len(da)} / RT시간 {len(rt_all)} "
+    diag["notes"].append(f"RT 구간행 {len(iv)} → 시간 {len(rt_all)} "
                          f"(구간수분포 {n_hist}) → 완결(n>={min_intervals}) {len(rt)}")
+    diag["notes"].append(f"DAM시간 {len(da)} ({da.index.min()}~{da.index.max()})")
 
     both = pd.concat([da.rename("da"), rt.rename("rt")], axis=1).dropna()
-    diag["notes"].append(f"DA∩RT 교집합 {len(both)}시간")
-    if len(both):
-        diag["notes"].append(f"범위 {str(both.index.min())}~{str(both.index.max())}")
+    diag["notes"].append(f"DA∩RT 교집합 {len(both)}시간"
+                         + (f" ({both.index.min()}~{both.index.max()})" if len(both) else ""))
 
     out, skipped_n = [], 0
     for t, row in both.iterrows():
@@ -366,7 +409,7 @@ def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=20, min_interval
         out.append({"dt_local": ts, "da_spp": round(float(row["da"]), 2),
                     "rt_spp": round(float(row["rt"]), 2),
                     "dart": round(float(row["da"] - row["rt"]), 2)})
-    diag["notes"].append(f"시트에 이미 있어 스킵 {skipped_n} → 신규 {len(out)}행")
+    diag["notes"].append(f"이미 시트에 있어 스킵 {skipped_n} → 신규 {len(out)}행")
     return out, diag
 
 
@@ -600,9 +643,10 @@ def peek(product: str = "load_fcst", pub: str = ""):
 
 
 @app.get("/settle")
-def settle(max_docs: int = 20, min_intervals: int = 4):
+def settle(max_docs: int = 25, min_intervals: int = 4, rtm_days: int = 2, max_rtm_docs: int = 220):
     """actuals가 안 채워질 때 원인을 보여준다. 시트 상태와 무관하게 MIS만 조회."""
-    rows, diag = fetch_settlements({}, set(), (), max_docs=max_docs, min_intervals=min_intervals)
+    rows, diag = fetch_settlements({}, set(), (), max_docs=max_docs, min_intervals=min_intervals,
+                                   rtm_days=rtm_days, max_rtm_docs=max_rtm_docs)
     return {"n_rows": len(rows), "diag": diag,
             "first": rows[:3], "last": rows[-3:],
             "hint": ("정상 — 워크플로가 이 행들을 actuals에 append해야 함" if rows else

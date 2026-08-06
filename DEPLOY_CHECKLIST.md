@@ -35,13 +35,13 @@ week_ending	n_hours_7d	hit_7d	save_vs_half_7d	save_vs_rt_7d	hit_cum	save_vs_rt_c
 
 ---
 
-## STEP 2. Render 배포 (main.py v16)
+## STEP 2. Render 배포 (main.py v17)
 
 ```
 https://power-model.onrender.com/health
-→ {"ok":true,"version":"v16","eia_key_set":true,"n_models":10, ...}
+→ {"ok":true,"version":"v17","eia_key_set":true,"n_models":10, ...}
 ```
-`v16`이 아니면 Render 대시보드 → Manual Deploy → Deploy latest commit.
+`v17`이 아니면 Render 대시보드 → Manual Deploy → Deploy latest commit.
 
 ### v16 추가 — EIA 키가 죽으면 조용히 품질이 떨어진다
 `EIA_API_KEY`가 없거나 EIA API가 실패하면 `eia = None`이 되고
@@ -107,9 +107,11 @@ Render URL은 하드코딩되어 있으므로 수정 불필요.
 
 ---
 
-## 남은 미해결 1건 — actuals
+## actuals — 원인 확정 및 수정 (v17)
 
-`fetch_settlements`가 왜 빈 배열을 반환하는지는 아직 모릅니다. v15 배포 후:
+`/settle` 결과로 원인이 나왔습니다: RTM(12301)은 **15분마다 1행짜리 문서**라
+시간 단위 중복제거가 4구간 중 3개를 버리고 있었습니다 (README §18).
+v17 배포 후 아래로 확인하세요:
 ```
 https://power-model.onrender.com/settle
 ```
@@ -137,6 +139,6 @@ https://power-model.onrender.com/settle
 | 5 | 주간 워크플로 Merge 카티전 곱 + 아이템별 실행 | 주간 v2에서 재작성 |
 | 6 | `analysis` 탭 부재 | **STEP 1-2에서 생성 필요** |
 | 7 | runlog에 정산 진단 자리 없음 | **STEP 1-1에서 컬럼 추가 필요** |
-| 8 | actuals 미채움 | **미해결 — `/settle` 대기** |
+| 8 | actuals 미채움 — RTM은 15분마다 1행인데 시간단위로 덮어써서 3구간 유실 | **v17에서 수정** |
 | 9 | EIA 실패 시 피처 2개가 조용히 NaN | v16에서 노출 (runlog에 기록) |
 | 10 | 피처 결측률 무관측 | v16에서 `feature_health` 추가 |
