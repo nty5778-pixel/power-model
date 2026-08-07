@@ -35,13 +35,13 @@ week_ending	n_hours_7d	hit_7d	save_vs_half_7d	save_vs_rt_7d	hit_cum	save_vs_rt_c
 
 ---
 
-## STEP 2. Render 배포 (main.py v17)
+## STEP 2. Render 배포 (main.py v18)
 
 ```
 https://power-model.onrender.com/health
-→ {"ok":true,"version":"v17","eia_key_set":true,"n_models":10, ...}
+→ {"ok":true,"version":"v18","eia_key_set":true,"n_models":10, ...}
 ```
-`v17`이 아니면 Render 대시보드 → Manual Deploy → Deploy latest commit.
+`v18`이 아니면 Render 대시보드 → Manual Deploy → Deploy latest commit.
 
 ### v16 추가 — EIA 키가 죽으면 조용히 품질이 떨어진다
 `EIA_API_KEY`가 없거나 EIA API가 실패하면 `eia = None`이 되고
@@ -105,6 +105,11 @@ Render URL은 하드코딩되어 있으므로 수정 불필요.
 
 `predictions`는 **재실행해도 행 수가 늘지 않아야** 정상입니다(중복 필터 작동 확인).
 
+### actuals 채우기 (v18)
+RTM 8일치를 다 받으려면 **수동 실행 3~4회**가 필요합니다. 매 실행 `runlog`의
+`settlement_notes` 끝에 `잔여 N개는 다음 실행에서` 가 사라질 때까지 반복하세요.
+`n_settlements`가 0이 되면 완료입니다.
+
 ---
 
 ## actuals — 원인 확정 및 수정 (v17)
@@ -139,6 +144,7 @@ https://power-model.onrender.com/settle
 | 5 | 주간 워크플로 Merge 카티전 곱 + 아이템별 실행 | 주간 v2에서 재작성 |
 | 6 | `analysis` 탭 부재 | **STEP 1-2에서 생성 필요** |
 | 7 | runlog에 정산 진단 자리 없음 | **STEP 1-1에서 컬럼 추가 필요** |
-| 8 | actuals 미채움 — RTM은 15분마다 1행인데 시간단위로 덮어써서 3구간 유실 | **v17에서 수정** |
+| 8 | actuals 미채움 — RTM은 15분마다 1행인데 시간단위로 덮어써서 3구간 유실 | **v17 수정 → 실측 정상 확인** |
+| 11 | RTM 백필이 한 번에 2.3일치만 회수 | v18에서 순차 수렴 (3~4회 실행이면 완료) |
 | 9 | EIA 실패 시 피처 2개가 조용히 NaN | v16에서 노출 (runlog에 기록) |
 | 10 | 피처 결측률 무관측 | v16에서 `feature_health` 추가 |

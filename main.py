@@ -1,6 +1,6 @@
 """
 ERCOT DART 3-class procurement scorer — Render web service.
-(v17: RTM 15분 구간 집계 수정 — actuals가 항상 비던 원인)
+(v18: RTM 백필 수렴 — 최신일 우선 + 오래된 미수집분 순차 회수)
 
 POST /score
   body: {
@@ -47,7 +47,7 @@ RID = {"load_fcst": 12312, "wind": 13028, "solar": 13483, "outage": 13103,
 STATE_COLS = ["lf_sys", "stwpf", "wgrpp", "stppf", "temp_fcst",
               "outage_total", "outage_houston", "outage_irr"]
 
-VERSION = "v17"
+VERSION = "v18"
 app = FastAPI()
 
 
@@ -59,6 +59,8 @@ class ScoreReq(BaseModel):
     have_actual_days: list | None = None
     have_actual_hours: list | None = None
     max_backfill_days: int = 7
+    rtm_days: int = 7
+    max_rtm_docs: int = 260
 
 
 # ---------------- MIS helpers ----------------
@@ -292,7 +294,7 @@ def _recent_csv_docs(rid, cache, n):
 
 
 def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=25,
-                      min_intervals=4, rtm_days=2, max_rtm_docs=220):
+                      min_intervals=4, rtm_days=7, max_rtm_docs=260):
     """LZ_HOUSTON DA/RT 정산값.
 
     DAM(12331)은 하루 1문서 × 24행이지만, RTM(12301)은 **15분마다 1문서 × 1행**이다.
@@ -369,9 +371,16 @@ def fetch_settlements(cache, skip_hours, skip_days=(), max_docs=25,
         h0 = p.floor("h")
         return str(h0) in skip_hours and str(h0 - pd.Timedelta(hours=1)) in skip_hours
 
-    picked = [d for d in cand if not _covered(d)][:max_rtm_docs]
-    diag["notes"].append(f"rtm:전체문서 {len(alldocs)}개 / 발행일 {len(pubdays)}일 → 대상 {sorted(want)} "
-                         f"후보 {len(cand)}개 중 기수집분 제외하고 {len(picked)}개 수신")
+    fresh = [d for d in cand if not _covered(d)]
+    # 최신일 먼저(운영 최신성) → 나머지는 오래된 순(백필 수렴). 상한을 넘겨도 매 실행 진도가 나간다.
+    newest = pubdays[0] if pubdays else ""
+    head = [d for d in fresh if str(d.get("PublishDate", ""))[:10] == newest]
+    tail = sorted([d for d in fresh if str(d.get("PublishDate", ""))[:10] != newest],
+                  key=lambda d: str(d.get("PublishDate", "")))
+    picked = (head[:110] + tail)[:max_rtm_docs]
+    diag["notes"].append(f"rtm:전체문서 {len(alldocs)}개 / 발행일 {len(pubdays)}일 → 대상 {len(want)}일 "
+                         f"({min(want)}~{max(want)}) 후보 {len(cand)}개, 미수집 {len(fresh)}개 중 {len(picked)}개 수신"
+                         + (f" — 잔여 {len(fresh)-len(picked)}개는 다음 실행에서" if len(fresh) > len(picked) else ""))
 
     parts, fails = [], 0
     for d in picked:
@@ -643,7 +652,7 @@ def peek(product: str = "load_fcst", pub: str = ""):
 
 
 @app.get("/settle")
-def settle(max_docs: int = 25, min_intervals: int = 4, rtm_days: int = 2, max_rtm_docs: int = 220):
+def settle(max_docs: int = 25, min_intervals: int = 4, rtm_days: int = 7, max_rtm_docs: int = 260):
     """actuals가 안 채워질 때 원인을 보여준다. 시트 상태와 무관하게 MIS만 조회."""
     rows, diag = fetch_settlements({}, set(), (), max_docs=max_docs, min_intervals=min_intervals,
                                    rtm_days=rtm_days, max_rtm_docs=max_rtm_docs)
@@ -793,7 +802,9 @@ def _score(req: ScoreReq):
         except Exception as e:
             skipped.append({"day": day.isoformat(), "reason": f"{type(e).__name__}: {e}"})
 
-    settlements, settle_diag = fetch_settlements(cache, have_act_h, have_act_d)
+    settlements, settle_diag = fetch_settlements(cache, have_act_h, have_act_d,
+                                                 rtm_days=req.rtm_days,
+                                                 max_rtm_docs=req.max_rtm_docs)
 
     return {
         "predictions": preds_out,
